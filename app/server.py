@@ -2,6 +2,8 @@
 
 WebAPI listens on 127.0.0.1:JAVA_PORT. This server owns DATABRICKS_APP_PORT:
   /WebAPI/...      forwarded to WebAPI (with APP_BRIDGE=on: as the user the Apps proxy signed in, see bridge.py)
+  /atlas/...       ATLAS's static files from the launcher's ATLAS folder (GET only; same gate as /WebAPI; 503 if
+                   the launcher could not fetch ATLAS). Paths resolve inside that folder only; symlinks out give 404.
   /ops/status      WebAPI pid, RSS, uptime, JVM heap after the last GC, cold-path samples and cold_done, runs so far,
                    and the launcher's start-up events (token, PgBouncer listening, Java start) in order
   /ops/run?label=&levels=1,8,32&warmup=30&seconds=180   start one load run in the background (one at a time)
@@ -38,6 +40,14 @@ LOCK = threading.Lock()
 CONCEPT_ID = re.compile(rb'"CONCEPT_ID"\s*:\s*(\d+)')
 BRIDGE = None  # bridge.Bridge when APP_BRIDGE=on
 CONTROLS = {"/ops/run", "/ops/rotate", "/ops/terminate"}
+ATLAS_ROOT = None  # the launcher's ATLAS folder, or None when the fetch failed
+ATLAS_TYPES = {".html": "text/html; charset=utf-8", ".js": "application/javascript; charset=utf-8",
+               ".css": "text/css; charset=utf-8", ".json": "application/json", ".svg": "image/svg+xml",
+               ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+               ".ico": "image/x-icon", ".webp": "image/webp", ".woff": "font/woff", ".woff2": "font/woff2",
+               ".ttf": "font/ttf", ".eot": "application/vnd.ms-fontobject", ".xml": "application/xml",
+               ".map": "application/json", ".txt": "text/plain; charset=utf-8", ".md": "text/plain; charset=utf-8"}
+NO_CACHE = {"index.html", "js/config-local.js"}
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization", "proxy-authenticate"}
 
 
@@ -232,8 +242,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def _atlas(self, raw_path):
+        """One ATLAS file. The gate runs first (400 ambiguous, 401 no identity), then the file must resolve inside
+        ATLAS_ROOT after symlinks are followed."""
+        path = bridge.normalize_path(self.path)
+        if not self._gate(path):
+            return
+        if ATLAS_ROOT is None:
+            err = next((e.get("error") for e in reversed(STATE.get("launcher") or []) if e.get("event") == "atlas_error"), None)
+            return self._json(503, {"error": "ATLAS is not available", "reason": err})
+        if raw_path == "/atlas":
+            self.send_response(302); self.send_header("Location", "/atlas/"); self.send_header("Content-Length", "0")
+            self.end_headers(); return
+        rel = path[len("/atlas/"):] or "index.html"
+        top = os.path.realpath(ATLAS_ROOT)
+        full = os.path.realpath(os.path.join(top, rel))
+        if not full.startswith(top + os.sep) or not os.path.isfile(full):
+            return self._json(404, {"error": "not found"})
+        with open(full, "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", ATLAS_TYPES.get(os.path.splitext(full)[1].lower(), "application/octet-stream"))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Cache-Control", "no-cache" if rel in NO_CACHE else "max-age=3600")
+        self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+
     def do_GET(self):
         u = urllib.parse.urlparse(self.path); qs = dict(urllib.parse.parse_qsl(u.query))
+        if u.path == "/atlas" or u.path.startswith("/atlas/"):
+            return self._atlas(u.path)
         if BRIDGE and u.path.startswith("/ops") and not self._gate(bridge.normalize_path(self.path)):
             return
         if u.path == "/ops/status":
@@ -284,9 +321,9 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
 
-def serve(java_proc, gc_log, pgb=None, mon=None, events=None, bridge_=None):
-    global BRIDGE
-    BRIDGE = bridge_
+def serve(java_proc, gc_log, pgb=None, mon=None, events=None, bridge_=None, atlas_root=None):
+    global BRIDGE, ATLAS_ROOT
+    BRIDGE, ATLAS_ROOT = bridge_, atlas_root
     STATE["java_pid"], STATE["gc_log"], STATE["pgb"], STATE["mon"] = java_proc.pid, gc_log, pgb, mon
     STATE["launcher"] = events if events is not None else []
 

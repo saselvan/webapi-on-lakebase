@@ -107,9 +107,15 @@ class FakeWebAPI(http.server.BaseHTTPRequestHandler):
         pass
 
     def _any(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n:
+            self.rfile.read(n)
         Seen.paths.append(self.path)
         b = b'{"fake":"webapi"}'
-        self.send_response(200); self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
+        self.send_response(200)
+        if self.path == "/WebAPI/user/login/db":
+            self.send_header("Bearer", "tok-1")  # the bridge's DB login; WebAPI sends the token in this header
+        self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
 
     do_GET = do_POST = _any
 

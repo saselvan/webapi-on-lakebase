@@ -3,8 +3,11 @@
 Databricks Apps has no Java runtime and no root, so the launcher brings its own:
 1. the Temurin 8u492-b09 JRE (the Java build of the pinned WebAPI image), checked by SHA-256;
 2. /var/lib/ohdsi/webapi from the pinned image ohdsi/webapi@sha256:bc5cffde... (its linux/amd64 manifest),
-   fetched from Docker Hub by digest; the manifest and every layer are checked by SHA-256.
-Then it runs WebAPI on 127.0.0.1:APP_JAVA_PORT, and server.py on DATABRICKS_APP_PORT (forwards /WebAPI, serves /ops).
+   fetched from Docker Hub by digest; the manifest and every layer are checked by SHA-256;
+3. ATLAS 2.15.0 (/usr/share/nginx/html/atlas) from the pinned image ohdsi/atlas@sha256:6814e8c5..., checked the same
+   way, with its config-local.js replaced by ATLAS_CONFIG. If that fails, WebAPI still starts and /atlas answers 503.
+Then it runs WebAPI on 127.0.0.1:APP_JAVA_PORT, and server.py on DATABRICKS_APP_PORT (forwards /WebAPI, serves
+/atlas and /ops).
 
 Secrets (PGB_LOCAL_PASSWORD, JASYPT_ENCRYPTOR_PASSWORD, BRIDGE_SECRET) arrive as env vars from app secret resources.
 
@@ -33,6 +36,22 @@ IMAGE_REPO = "ohdsi/webapi"
 IMAGE_INDEX = "sha256:bc5cffde0d6f29bccc994876bf3cb290e8c3f4e5c087ab28c7163343c0b67393"  # WebAPI 2.15.2
 PLATFORM_ARCH = {"x86_64": "amd64", "aarch64": "arm64"}
 WEBAPI_PREFIX = "var/lib/ohdsi/webapi/"
+ATLAS_REPO = "ohdsi/atlas"
+ATLAS_INDEX = "sha256:6814e8c5b5366b50bc197b1eb2881689e5852784742b91b9636eec514f5a555e"  # ATLAS 2.15.0
+ATLAS_PREFIX = "usr/share/nginx/html/atlas/"
+ATLAS_CONFIG = """define([], function () {
+  // Written by app/launcher.py at start; it replaces the image's own config-local.js.
+  // WebAPI is this app's /WebAPI/. Sign-in is on: ATLAS asks /WebAPI/user/me, and the front server answers as the
+  // user the Databricks Apps proxy signed in (app/bridge.py). There are no login providers: users never log in to ATLAS.
+  return {
+    api: { name: "WebAPI", url: window.location.origin + "/WebAPI/" },
+    userAuthenticationEnabled: true,
+    authProviders: [],
+    enableTermsAndConditions: false,
+    enableSkipLogin: false
+  };
+});
+"""
 GC_LOG = "/tmp/webapi-app/gc.log"
 PGB_BINARY = "pgbouncer-1.26.1-linux-amd64-static"  # pgbouncer/Dockerfile.static
 PGB_WEBAPI_URL = "jdbc:postgresql://127.0.0.1:6432/webapi?sslmode=disable&ApplicationName=webapi-pgb"
@@ -248,6 +267,31 @@ def fetch_webapi(work):
     return target
 
 
+def write_atlas_config(root):
+    """Write ATLAS's config-local.js from ATLAS_CONFIG. A file or symlink already there is removed first."""
+    path = os.path.join(root, "js", "config-local.js")
+    if os.path.lexists(path):
+        os.remove(path)
+    with open(path, "x") as f:
+        f.write(ATLAS_CONFIG)
+
+
+def fetch_atlas(work):
+    """ATLAS 2.15.0 from the pinned image, with the generated config. Returns its folder, or None after an
+    atlas_error event: WebAPI still starts, and /atlas answers 503 with the reason."""
+    root = os.path.join(work, "atlas")
+    try:
+        _, n = fetch_pinned_image(ATLAS_REPO, ATLAS_INDEX, ATLAS_PREFIX, root, work)
+        if not os.path.isfile(os.path.join(root, "index.html")):
+            raise RuntimeError("index.html not found in the ATLAS image")
+        write_atlas_config(root)
+    except Exception as e:
+        log("atlas_error", error=f"{type(e).__name__}: {e}"[:300])
+        return None
+    log("atlas", index=ATLAS_INDEX, files=n)
+    return root
+
+
 def java_cmd(java, root):
     opts = os.environ.get("DEFAULT_JAVA_OPTS", "-Djava.security.egd=file:///dev/./urandom").split()
     opts += os.environ.get("APP_HEAP", "-Xms1g -Xmx3g").split()
@@ -316,6 +360,7 @@ def main():
     t0 = time.monotonic()
     java = fetch_jre(work)
     root = fetch_webapi(work)
+    atlas = fetch_atlas(work)
     pgb = None
     if os.environ.get("APP_DB", "native") == "pgbouncer":
         if os.environ.get("DATASOURCE_PASSWORD") or os.environ.get("WEBAPI_DATASOURCE_URL"):
@@ -343,7 +388,7 @@ def main():
         mon = Monitors(int(os.environ.get("APP_JAVA_PORT", "8081")), os.environ["LAKEBASE_HOST"],
                        os.environ["DATABRICKS_CLIENT_ID"], lambda: pgb.token, bridge_=br)
         mon.start()
-    server.serve(proc, GC_LOG, pgb=pgb, mon=mon, events=EVENTS, bridge_=br)  # front server on DATABRICKS_APP_PORT
+    server.serve(proc, GC_LOG, pgb=pgb, mon=mon, events=EVENTS, bridge_=br, atlas_root=atlas)  # front server on DATABRICKS_APP_PORT
 
 
 if __name__ == "__main__":
@@ -351,5 +396,6 @@ if __name__ == "__main__":
         w = os.environ.get("APP_WORK", "/tmp/webapi-app")
         os.makedirs(w, exist_ok=True)
         print(fetch_webapi(w))
+        print(fetch_atlas(w))
     else:
         main()
