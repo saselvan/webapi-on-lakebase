@@ -10,7 +10,7 @@ import hashlib, json, os, shutil, socket, sys, tempfile, threading, time, types,
 
 APP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app")
 TMP = tempfile.mkdtemp(prefix="webapi-app-test.")
-for f in ("launcher.py", "server.py", "pgb.py", "monitors.py"):  # a copy, so the test never writes into the repo
+for f in ("launcher.py", "server.py", "pgb.py", "monitors.py", "bridge.py"):  # a copy, so the test never writes into the repo
     shutil.copy(os.path.join(APP, f), TMP)
 sys.path.insert(0, TMP)
 import launcher, server  # noqa: E402

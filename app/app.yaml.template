@@ -2,7 +2,10 @@
 # tools/render.py renders it into the staging folder (outside the repo); the Lakebase host never enters the repo.
 # No native-login password and no Lakebase JDBC URL: WebAPI reaches Lakebase only through 127.0.0.1:6432.
 # Secrets: app resources pgb-local-password (WebAPI -> PgBouncer only) and webapi-jasypt-key
-# (tools/setup_and_deploy.sh attaches them from SECRET_SCOPE).
+# Secret webapi-bridge-secret: the bridge's WebAPI DB-login secret (made new by tools/setup_and_deploy.sh).
+# WebAPI security is ON: the Apps proxy signs users in with workspace SSO; app/bridge.py maps X-Forwarded-Email
+# to a WebAPI DB login. The launcher builds the DB-login query from a new bcrypt hash of BRIDGE_SECRET, so no hash
+# and no secret is in this file. tools/setup_and_deploy.sh attaches the secrets from SECRET_SCOPE.
 # DATABRICKS_CLIENT_ID / _SECRET / _HOST are injected by Databricks Apps (the app's service principal).
 command: ["python", "launcher.py"]
 env:
@@ -30,7 +33,26 @@ env:
   - {name: FLYWAY_TABLE, value: schema_history}
   - {name: flyway_baselineVersionAsString, value: "2.2.5.20180212152023"}
   - {name: FLYWAY_BASELINEDESCRIPTION, value: Base Migration}
-  - {name: SECURITY_PROVIDER, value: DisabledSecurity}
+  - {name: SECURITY_PROVIDER, value: AtlasRegularSecurity}
+  - {name: SECURITY_AUTH_JDBC_ENABLED, value: "true"}
+  - {name: SECURITY_AUTH_WINDOWS_ENABLED, value: "false"}
+  - {name: SECURITY_AUTH_KERBEROS_ENABLED, value: "false"}
+  - {name: SECURITY_AUTH_OPENID_ENABLED, value: "false"}
+  - {name: SECURITY_AUTH_FACEBOOK_ENABLED, value: "false"}
+  - {name: SECURITY_AUTH_GITHUB_ENABLED, value: "false"}
+  - {name: SECURITY_AUTH_GOOGLE_ENABLED, value: "false"}
+  - {name: SECURITY_AUTH_LDAP_ENABLED, value: "false"}
+  - {name: SECURITY_AUTH_AD_ENABLED, value: "false"}
+  - {name: SECURITY_AUTH_CAS_ENABLED, value: "false"}
+  - {name: SECURITY_DEFAULTGLOBALREADPERMISSIONS, value: "false"}
+  - {name: SECURITY_DB_DATASOURCE_DRIVERCLASSNAME, value: org.postgresql.Driver}
+  - {name: SECURITY_DB_DATASOURCE_USERNAME, value: webapi}
+  - {name: SECURITY_DB_DATASOURCE_SCHEMA, value: __WEBAPI_SCHEMA__}
+  - {name: SECURITY_ORIGIN, value: "__APP_URL__"}
+  - {name: APP_BRIDGE, value: "on"}
+  - {name: BRIDGE_SECRET, valueFrom: webapi-bridge-secret}
+  - {name: OPS_ADMINS, value: "__OPS_ADMINS__"}
+  - {name: OPS_CONTROL, value: "__OPS_CONTROL__"}
   - {name: SOLR_ENDPOINT, value: ""}
   - {name: JASYPT_ENCRYPTOR_ENABLED, value: "true"}
   - {name: JASYPT_ENCRYPTOR_ALGORITHM, value: "PBEWITHSHA256AND128BITAES-CBC-BC"}

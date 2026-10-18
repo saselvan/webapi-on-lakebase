@@ -8,6 +8,8 @@ sampler: every 60 s, a NEW direct login to Lakebase as the app's service princip
          in NATIVE_ROLES (comma-separated, optional) are counted even though their details are hidden.
 terminate(): the SP ends its own Lakebase sessions except the sampler's (a role may signal its own backends).
 Results stay in memory; read them through /ops/conn. Nothing here holds or returns a secret.
+With APP_BRIDGE=on the ticker logs in to WebAPI as bridge.INTERNAL_ID through the bridge; that login needs the rights
+for its paths (see README, "Security").
 """
 import http.client, os, re, threading, time
 
@@ -23,7 +25,8 @@ if not re.fullmatch(r"[a-z_][a-z0-9_]*", APP_SCHEMA):
 
 
 class Monitors:
-    def __init__(self, java_port, host, user, token_fn, period_s=60):
+    def __init__(self, java_port, host, user, token_fn, period_s=60, bridge_=None):
+        self.bridge = bridge_
         self.java_port, self.host, self.user, self.token_fn, self.period = java_port, host, user, token_fn, period_s
         self.ticks, self.samples, self.terminations = [], [], []
         self.seen = {}  # SP session key (pid, backend_start) -> backend_start epoch
@@ -32,6 +35,10 @@ class Monitors:
     def _get(self, path):
         t0 = time.perf_counter()
         try:
+            if self.bridge:
+                import bridge
+                st, _, body = self.bridge.request("GET", path, None, {}, bridge.INTERNAL_ID)
+                return st, round((time.perf_counter() - t0) * 1000, 1), len(body)
             c = http.client.HTTPConnection("127.0.0.1", self.java_port, timeout=60)
             c.request("GET", path); r = c.getresponse(); body = r.read(); c.close()
             return r.status, round((time.perf_counter() - t0) * 1000, 1), len(body)

@@ -1,7 +1,7 @@
 """Front server and load runner, inside the WebAPI app.
 
 WebAPI listens on 127.0.0.1:JAVA_PORT. This server owns DATABRICKS_APP_PORT:
-  /WebAPI/...      forwarded to WebAPI unchanged
+  /WebAPI/...      forwarded to WebAPI (with APP_BRIDGE=on: as the user the Apps proxy signed in, see bridge.py)
   /ops/status      WebAPI pid, RSS, uptime, JVM heap after the last GC, cold-path samples and cold_done, runs so far,
                    and the launcher's start-up events (token, PgBouncer listening, Java start) in order
   /ops/run?label=&levels=1,8,32&warmup=30&seconds=180   start one load run in the background (one at a time)
@@ -14,13 +14,20 @@ WebAPI listens on 127.0.0.1:JAVA_PORT. This server owns DATABRICKS_APP_PORT:
   and terminate_at=<s> (end the sessions <s> seconds into the first level)
 
 The load runner talks to WebAPI on 127.0.0.1 (the REST layer, no Apps proxy), from the same container.
-A user loops the click path: search -> open the top concept -> expand its descendants, on source SOURCE_KEY.
+A user loops the click path: search -> open the top concept -> its ancestors and descendants, on source SOURCE_KEY.
+(ancestorAndDescendant: WebAPI's per-source role grants it; that role has no right for /concept/{id}/descendants.)
 Each request is one sample: level, user, step, query index, start time, ms, HTTP status, bytes. No query text is
 kept in a sample. Queries come from queries.json (you write it; staged with the app, never in the repo); the top
 concept id is read from the first 2 KB of the search body, so the client does not parse multi-MB JSON under load.
 Without queries.json the cold paths are skipped and /ops/run answers 404; everything else works.
+
+APP_BRIDGE=on: WebAPI security is on and every request passes bridge.py's gate. /ops/* answers only the identities
+in OPS_ADMINS (404 for the rest), and the controls (/ops/run, /ops/rotate, /ops/terminate) also need OPS_CONTROL=on.
+The load runner and the ticker log in to WebAPI as bridge.INTERNAL_ID.
 """
 import http.client, http.server, json, os, re, socketserver, threading, time, urllib.parse
+
+import bridge
 
 JAVA_PORT = int(os.environ.get("APP_JAVA_PORT", "8081"))
 SOURCE_KEY = os.environ.get("SOURCE_KEY", "VOCAB")
@@ -29,6 +36,8 @@ STATE = {"started": time.time(), "java_pid": None, "gc_log": None, "cold": [], "
          "pgb": None, "mon": None}
 LOCK = threading.Lock()
 CONCEPT_ID = re.compile(rb'"CONCEPT_ID"\s*:\s*(\d+)')
+BRIDGE = None  # bridge.Bridge when APP_BRIDGE=on
+CONTROLS = {"/ops/run", "/ops/rotate", "/ops/terminate"}
 HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade", "proxy-authorization", "proxy-authenticate"}
 
 
@@ -43,9 +52,17 @@ def queries():
 
 def timed_get(conn, path):
     t0 = time.perf_counter()
-    conn.request("GET", path)
-    r = conn.getresponse()
-    body = r.read()
+    for attempt in (0, 1):
+        hdrs = {}
+        if BRIDGE:
+            tok = BRIDGE.token(bridge.INTERNAL_ID)
+            hdrs["Authorization"] = f"Bearer {tok}"
+        conn.request("GET", path, headers=hdrs)
+        r = conn.getresponse()
+        body = r.read()
+        if not (BRIDGE and r.status == 401 and not attempt):
+            break
+        BRIDGE.drop(bridge.INTERNAL_ID, tok)  # one fresh login, then the request again (inside the timed sample)
     return round((time.perf_counter() - t0) * 1000, 2), r.status, body
 
 
@@ -58,7 +75,7 @@ def click_path(conn, qi, q, record):
         return
     cid = int(m.group(1))
     for step, path in (("concept", f"/WebAPI/vocabulary/{SOURCE_KEY}/concept/{cid}"),
-                       ("descendants", f"/WebAPI/vocabulary/{SOURCE_KEY}/concept/{cid}/descendants")):
+                       ("ancestorAndDescendant", f"/WebAPI/vocabulary/{SOURCE_KEY}/concept/{cid}/ancestorAndDescendant")):
         t = time.time(); ms, st, body = timed_get(conn, path)
         record(step, qi, t, ms, st, len(body))
 
@@ -158,9 +175,49 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(code); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
 
+    def _admins(self):
+        return {a.strip().lower() for a in os.environ.get("OPS_ADMINS", "").split(",") if a.strip()}
+
+    def _gate(self, path):
+        """True when the request may go on; otherwise the error is already sent."""
+        if not BRIDGE:
+            return True
+        if path is None:
+            self._json(400, {"error": "ambiguous path"}); return False
+        ident = bridge.identity(self.headers)
+        if path == "/ops" or path.startswith("/ops/"):
+            ok = ident is not None and ident in self._admins()
+            if ok and path in CONTROLS:
+                ok = os.environ.get("OPS_CONTROL", "off") == "on"
+            if not ok:
+                self._json(404, {"error": "not found"}); return False
+            return True
+        if bridge.blocked(path):
+            self._json(403, {"error": "sign-in goes through the workspace"}); return False
+        if ident is None:
+            self._json(401, {"error": "no workspace identity"}); return False
+        return True
+
     def _forward(self):
         n = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(n) if n else None
+        if BRIDGE:
+            if not self._gate(bridge.normalize_path(self.path)):
+                return
+            try:
+                st, hdrs, data = BRIDGE.request(self.command, self.path, body,
+                                                {k: v for k, v in self.headers.items() if k.lower() not in HOP | {"host"}},
+                                                bridge.identity(self.headers))
+            except PermissionError:
+                return self._json(502, {"error": "WebAPI login refused"})
+            except Exception as e:
+                return self._json(502, {"error": f"WebAPI not reachable: {type(e).__name__}"})
+            self.send_response(st)
+            for k, v in hdrs:
+                if k.lower() not in HOP | {"content-length"}:
+                    self.send_header(k, v)
+            self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+            return
         conn = new_conn()
         try:
             conn.request(self.command, self.path, body, {k: v for k, v in self.headers.items() if k.lower() not in HOP | {"host"}})
@@ -177,6 +234,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         u = urllib.parse.urlparse(self.path); qs = dict(urllib.parse.parse_qsl(u.query))
+        if BRIDGE and u.path.startswith("/ops") and not self._gate(bridge.normalize_path(self.path)):
+            return
         if u.path == "/ops/status":
             with LOCK:
                 runs = {k: {x: v[x] for x in v if x not in ("samples", "errors")} | {"n_samples": len(v["samples"]), "n_errors": len(v["errors"])}
@@ -184,7 +243,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self._json(200, {"uptime_s": round(time.time() - STATE["started"], 1), "java_pid": STATE["java_pid"],
                                     "webapi_ready_s": STATE.get("webapi_ready_s"), "rss_kb": rss_kb(), "heap": heap(), "cold": STATE["cold"],
                                     "cold_done": STATE.get("cold_done", False), "launcher": STATE.get("launcher", []),
-                                    "running": STATE["running"], "runs": runs})
+                                    "running": STATE["running"], "runs": runs,
+                                    "bridge": BRIDGE.status() if BRIDGE else None})
         if u.path == "/ops/run":
             if queries() is None:
                 return self._json(404, {"error": "no queries.json staged with the app"})
@@ -209,6 +269,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
+        if BRIDGE and u.path.startswith("/ops") and not self._gate(bridge.normalize_path(self.path)):
+            return
         if u.path == "/ops/rotate" and STATE["pgb"]:
             return self._json(200, {"rotated": STATE["pgb"].rotate("forced")})
         if u.path == "/ops/terminate" and STATE["mon"]:
@@ -222,14 +284,19 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
 
-def serve(java_proc, gc_log, pgb=None, mon=None, events=None):
+def serve(java_proc, gc_log, pgb=None, mon=None, events=None, bridge_=None):
+    global BRIDGE
+    BRIDGE = bridge_
     STATE["java_pid"], STATE["gc_log"], STATE["pgb"], STATE["mon"] = java_proc.pid, gc_log, pgb, mon
     STATE["launcher"] = events if events is not None else []
 
     def wait_then_cold():
         while java_proc.poll() is None:
             try:
-                c = new_conn(); c.request("GET", "/WebAPI/info"); ok = c.getresponse().status == 200; c.close()
+                c = new_conn(); c.request("GET", "/WebAPI/info"); r = c.getresponse(); r.read(); c.close()
+                ok = r.status == 200
+                if ok and BRIDGE:
+                    BRIDGE.token(bridge.INTERNAL_ID)  # the first login; a refusal is kept in /ops/status bridge
                 if ok:
                     STATE["webapi_ready_s"] = round(time.time() - STATE["started"], 1)
                     print(json.dumps({"event": "webapi_ready", "seconds": STATE["webapi_ready_s"]}), flush=True)

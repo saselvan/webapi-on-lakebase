@@ -3,7 +3,9 @@
 Copies app/*.py, requirements.txt, your static PgBouncer binary and (optional) your queries.json into the staging
 folder, fills the placeholders of app/app.yaml.template, and refuses to write app.yaml if:
   a setting is missing or malformed, a placeholder is left, the template carries a native-login password or JDBC URL,
-  the binary's SHA-256 differs from PGB_SHA256, or the staging folder is inside the repo (the host must stay out of git).
+  WebAPI security is not on exactly as app/bridge.py needs it (AtlasRegularSecurity, only the DB login, no global read,
+  the bridge secret as an app resource, no DB-login query or password in the file), the binary's SHA-256 differs from
+  PGB_SHA256, or the staging folder is inside the repo (the host must stay out of git).
 Prints no host and no secret.
 Usage: python3 -I tools/render.py [--config config.env] [--stage ~/.webapi-on-lakebase/stage] [--template <file>]
 """
@@ -11,7 +13,7 @@ import argparse, hashlib, os, re, shutil, sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP = os.path.join(REPO, "app")
-APP_FILES = ("launcher.py", "server.py", "pgb.py", "monitors.py", "requirements.txt")
+APP_FILES = ("launcher.py", "server.py", "pgb.py", "monitors.py", "bridge.py", "requirements.txt")
 BINARY = "pgbouncer-1.26.1-linux-amd64-static"  # the name app/launcher.py looks for
 RULES = {  # setting -> pattern its value must match
     "LAKEBASE_HOST": r"[A-Za-z0-9.-]+",
@@ -21,8 +23,20 @@ RULES = {  # setting -> pattern its value must match
     "TICK_CONCEPT_ID": r"[0-9]*",  # empty = the ticker skips the concept path
     "PGB_SHA256": r"[0-9a-f]{64}",
     "PGB_BINARY": r".+",
+    "APP_URL": r"https://[a-z0-9.-]+",
+    "OPS_ADMINS": r"(?:[a-z0-9._+-]+@[a-z0-9.-]+|[0-9a-f-]{36})(?:,(?:[a-z0-9._+-]+@[a-z0-9.-]+|[0-9a-f-]{36}))*|",
+    "OPS_CONTROL": r"on|off|",  # empty = off
 }
-OPTIONAL = {"TICK_CONCEPT_ID", "QUERIES_JSON"}
+OPTIONAL = {"TICK_CONCEPT_ID", "QUERIES_JSON", "OPS_ADMINS", "OPS_CONTROL"}
+SECURITY = {  # env name -> (kind, value) the rendered app.yaml must hold
+    "APP_BRIDGE": ("value", "on"),
+    "BRIDGE_SECRET": ("valueFrom", "webapi-bridge-secret"),
+    "SECURITY_PROVIDER": ("value", "AtlasRegularSecurity"),
+    "SECURITY_AUTH_JDBC_ENABLED": ("value", "true"),
+    "SECURITY_DEFAULTGLOBALREADPERMISSIONS": ("value", "false"),
+}
+AUTH_OFF = ("WINDOWS", "KERBEROS", "OPENID", "FACEBOOK", "GITHUB", "GOOGLE", "LDAP", "AD", "CAS")  # as app/launcher.py
+SET_BY_LAUNCHER = ("SECURITY_DB_DATASOURCE_PASSWORD", "SECURITY_DB_DATASOURCE_AUTHENTICATIONQUERY", "SECURITY_DB_DATASOURCE_URL")
 ENV_LINE = re.compile(r"^\s*- \{name: ([A-Za-z0-9_]+), (value|valueFrom): (.*)\}\s*$")
 
 
@@ -49,6 +63,8 @@ def read_config(path):
 def check(conf):
     for k, pat in RULES.items():
         v = conf.get(k, "")
+        if k == "OPS_ADMINS":
+            v = v.lower()  # the bridge compares lowercased identities
         if not v and k not in OPTIONAL:
             fail(f"{k} is not set")
         if not re.fullmatch(pat, v):
@@ -68,7 +84,9 @@ def sha256(path):
 
 def render(template_text, conf):
     text = template_text
-    for k in ("LAKEBASE_HOST", "LAKEBASE_ENDPOINT", "WEBAPI_SCHEMA", "SOURCE_KEY", "TICK_CONCEPT_ID", "PGB_SHA256"):
+    conf = {**conf, "OPS_ADMINS": conf.get("OPS_ADMINS", "").lower(), "OPS_CONTROL": conf.get("OPS_CONTROL") or "off"}
+    for k in ("LAKEBASE_HOST", "LAKEBASE_ENDPOINT", "WEBAPI_SCHEMA", "SOURCE_KEY", "TICK_CONCEPT_ID", "PGB_SHA256",
+              "APP_URL", "OPS_ADMINS", "OPS_CONTROL"):
         text = text.replace(f"__{k}__", conf.get(k, ""))
     if re.search(r"__[A-Z_]+__", text):
         fail("a placeholder was not replaced")
@@ -81,6 +99,14 @@ def render(template_text, conf):
         fail("native login in the template")
     if env.get("APP_DB") != ("value", "pgbouncer") or env.get("PGB_LOCAL_PASSWORD") != ("valueFrom", "pgb-local-password"):
         fail("the template is not in PgBouncer mode")
+    for k, want in SECURITY.items():
+        if env.get(k) != want:
+            fail(f"security is not on as the bridge needs it: {k}")
+    others = [m for m in AUTH_OFF if env.get(f"SECURITY_AUTH_{m}_ENABLED") != ("value", "false")]
+    if others:
+        fail(f"security is not on as the bridge needs it: these logins must be false: {','.join(others)}")
+    if any(k in env for k in SET_BY_LAUNCHER):
+        fail("the DB-login query or password is in the template; the launcher sets them")
     return text, env
 
 

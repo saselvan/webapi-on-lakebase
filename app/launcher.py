@@ -6,13 +6,18 @@ Databricks Apps has no Java runtime and no root, so the launcher brings its own:
    fetched from Docker Hub by digest; the manifest and every layer are checked by SHA-256.
 Then it runs WebAPI on 127.0.0.1:APP_JAVA_PORT, and server.py on DATABRICKS_APP_PORT (forwards /WebAPI, serves /ops).
 
-Secrets (PGB_LOCAL_PASSWORD, JASYPT_ENCRYPTOR_PASSWORD) arrive as env vars from app secret resources.
+Secrets (PGB_LOCAL_PASSWORD, JASYPT_ENCRYPTOR_PASSWORD, BRIDGE_SECRET) arrive as env vars from app secret resources.
 
 APP_DB=pgbouncer: before Java starts, the launcher checks the static PgBouncer binary against PGB_SHA256, mints a
 token for the app's service principal, starts PgBouncer on 127.0.0.1:6432 and its refresher (pgb.py), and points
 WebAPI at it with the LOCAL password (secret PGB_LOCAL_PASSWORD). A native-login secret must not be attached: the
 launcher refuses to start if DATASOURCE_PASSWORD is set in this mode.
 APP_DB=native (the default) logs WebAPI in with DATASOURCE_PASSWORD and WEBAPI_DATASOURCE_URL instead.
+
+APP_BRIDGE=on turns WebAPI security on behind the Apps proxy (bridge.py). It needs APP_DB=pgbouncer, the secret
+BRIDGE_SECRET and SECURITY_PROVIDER=AtlasRegularSecurity with only the DB login on. The launcher makes a new bcrypt
+hash of the secret, builds WebAPI's DB-login query from it, points that login at PgBouncer, and keeps the raw secret
+out of Java's environment. It refuses to start on any other security setting.
 """
 import urllib.error
 import hashlib, json, os, platform, shutil, signal, subprocess, sys, tarfile, threading, time, urllib.request
@@ -31,6 +36,8 @@ WEBAPI_PREFIX = "var/lib/ohdsi/webapi/"
 GC_LOG = "/tmp/webapi-app/gc.log"
 PGB_BINARY = "pgbouncer-1.26.1-linux-amd64-static"  # pgbouncer/Dockerfile.static
 PGB_WEBAPI_URL = "jdbc:postgresql://127.0.0.1:6432/webapi?sslmode=disable&ApplicationName=webapi-pgb"
+PGB_AUTH_URL = "jdbc:postgresql://127.0.0.1:6432/webapi?sslmode=disable&ApplicationName=webapi-pgb-auth"
+AUTH_OFF = ("WINDOWS", "KERBEROS", "OPENID", "FACEBOOK", "GITHUB", "GOOGLE", "LDAP", "AD", "CAS")
 MANIFEST_TYPES = ",".join([
     "application/vnd.oci.image.index.v1+json", "application/vnd.oci.image.manifest.v1+json",
     "application/vnd.docker.distribution.manifest.list.v2+json", "application/vnd.docker.distribution.manifest.v2+json",
@@ -180,6 +187,39 @@ def start_pgbouncer(work):
     return pgb
 
 
+def bridge_env(env):
+    """Check the security settings and add WebAPI's DB-login settings to env. Returns the Bridge."""
+    import bridge
+    if env.get("APP_DB") != "pgbouncer":
+        raise RuntimeError("APP_BRIDGE=on needs APP_DB=pgbouncer")
+    if env.get("SECURITY_PROVIDER") != "AtlasRegularSecurity":
+        raise RuntimeError("APP_BRIDGE=on needs SECURITY_PROVIDER=AtlasRegularSecurity")
+    if env.get("SECURITY_AUTH_JDBC_ENABLED") != "true":
+        raise RuntimeError("APP_BRIDGE=on needs SECURITY_AUTH_JDBC_ENABLED=true")
+    on = [m for m in AUTH_OFF if env.get(f"SECURITY_AUTH_{m}_ENABLED") != "false"]
+    if on:
+        raise RuntimeError(f"APP_BRIDGE=on: these logins must be set to false: {','.join(on)}")
+    if env.get("SECURITY_DEFAULTGLOBALREADPERMISSIONS") != "false":
+        raise RuntimeError("APP_BRIDGE=on needs SECURITY_DEFAULTGLOBALREADPERMISSIONS=false")
+    secret = env.pop("BRIDGE_SECRET", "")
+    b = bridge.Bridge(int(env.get("APP_JAVA_PORT", "8081")), secret)
+    env["SECURITY_DB_DATASOURCE_AUTHENTICATIONQUERY"] = bridge.auth_query(bridge.make_hash(secret))
+    env["SECURITY_DB_DATASOURCE_URL"] = PGB_AUTH_URL
+    env["SECURITY_DB_DATASOURCE_PASSWORD"] = env["DATASOURCE_PASSWORD"]
+    return b
+
+
+def security(env):
+    """The Bridge when APP_BRIDGE=on (env gets WebAPI's DB-login settings), else None. Refuses mixed settings."""
+    if env.get("APP_BRIDGE", "off") == "on":
+        br = bridge_env(env)
+        log("bridge", provider=env["SECURITY_PROVIDER"], db_login="pgbouncer")
+        return br
+    if env.get("SECURITY_PROVIDER", "DisabledSecurity") != "DisabledSecurity" or env.get("BRIDGE_SECRET"):
+        raise RuntimeError("security settings without APP_BRIDGE=on; set APP_BRIDGE=on or remove them")
+    return None
+
+
 def main():
     work = os.environ.get("APP_WORK", "/tmp/webapi-app")
     shutil.rmtree(work, ignore_errors=True)
@@ -200,6 +240,8 @@ def main():
     env = dict(os.environ)
     env["FLYWAY_DATASOURCE_PASSWORD"] = env["DATASOURCE_PASSWORD"]
     env["DATASOURCE_URL"] = env["FLYWAY_DATASOURCE_URL"] = env["WEBAPI_DATASOURCE_URL"]
+    br = security(env)
+    os.environ.pop("BRIDGE_SECRET", None)
     cmd = java_cmd(java, root)
     log("start", prep_seconds=round(time.monotonic() - t0, 1), cmd=cmd)
     proc = subprocess.Popen(cmd, cwd=root, env=env)  # WebAPI on 127.0.0.1:APP_JAVA_PORT; logs to stdout
@@ -210,9 +252,9 @@ def main():
     if pgb:
         from monitors import Monitors
         mon = Monitors(int(os.environ.get("APP_JAVA_PORT", "8081")), os.environ["LAKEBASE_HOST"],
-                       os.environ["DATABRICKS_CLIENT_ID"], lambda: pgb.token)
+                       os.environ["DATABRICKS_CLIENT_ID"], lambda: pgb.token, bridge_=br)
         mon.start()
-    server.serve(proc, GC_LOG, pgb=pgb, mon=mon, events=EVENTS)  # front server on DATABRICKS_APP_PORT
+    server.serve(proc, GC_LOG, pgb=pgb, mon=mon, events=EVENTS, bridge_=br)  # front server on DATABRICKS_APP_PORT
 
 
 if __name__ == "__main__":

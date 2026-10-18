@@ -5,8 +5,11 @@
 #   1. Lakebase: a Postgres role for the app's service principal; CONNECT + CREATE on databricks_postgres (Flyway
 #      creates WEBAPI_SCHEMA); USAGE on VOCAB_SCHEMA + SELECT on its tables and views. Stops if WEBAPI_SCHEMA exists.
 #   2. Secrets pgb_local_password (WebAPI -> PgBouncer only) and webapi_jasypt_key in SECRET_SCOPE, made once in
-#      ~/.webapi-on-lakebase/secrets (0600); app resources pgb-local-password and webapi-jasypt-key point at them.
-#   3. Starts the app compute if it is stopped (billable), uploads the staging folder, deploys.
+#      ~/.webapi-on-lakebase/secrets (0600), and a NEW bridge_secret (WebAPI DB login of app/bridge.py), made in a 0600
+#      temp file and deleted after the put: no copy stays on your machine. App resources pgb-local-password,
+#      webapi-jasypt-key and webapi-bridge-secret point at them.
+#   3. Waits while the app compute is STARTING (apps create starts it), starts it if STOPPED (billable), uploads the
+#      staging folder, deploys. Then follow README, "Security": first admin, source, roles (tools/webapi_admin.py).
 # The app must exist first: databricks apps create <APP_NAME> --profile <DATABRICKS_PROFILE>
 # Stop later: databricks apps stop <APP_NAME> --profile <DATABRICKS_PROFILE>
 # Usage: python3 -I tools/render.py && bash tools/setup_and_deploy.sh [config.env]
@@ -27,6 +30,8 @@ DEST="/Workspace/Users/$OWNER/$APP"
 umask 077
 [ -s "$SRC/app.yaml" ] || { echo "run tools/render.py first"; exit 1; }
 databricks apps get "$APP" --profile "$P" > /dev/null 2>&1 || { echo "app $APP not found; create it: databricks apps create $APP --profile $P"; exit 1; }
+URL=$(databricks apps get "$APP" --profile "$P" -o json | python3 -I -c 'import sys,json; print(json.load(sys.stdin)["url"])')
+[ "$URL" = "${APP_URL:-}" ] || { echo "APP_URL in config.env differs from the app's URL ($URL); fix it and run tools/render.py again"; exit 1; }
 
 echo "1/3 Lakebase role and grants for the app's service principal"
 SP=$(databricks apps get "$APP" --profile "$P" -o json | python3 -I -c 'import sys,json; print(json.load(sys.stdin)["service_principal_client_id"])')
@@ -67,17 +72,28 @@ for pair in pgb_local_password:pgb_local_pass webapi_jasypt_key:webapi_jasypt_ke
   python3 -I -c 'import json,sys; print(json.dumps({"scope":sys.argv[1],"key":sys.argv[2],"string_value":open(sys.argv[3]).read().strip()}))' "$SCOPE" "$key" "$file" > "$tmp"
   databricks secrets put-secret --json "@$tmp" --profile "$P"; rm -f "$tmp"
 done
+bs="$(mktemp)"; tmp="$(mktemp)"; chmod 600 "$bs" "$tmp"
+python3 -I -c 'import secrets,sys; open(sys.argv[1],"w").write(secrets.token_urlsafe(32))' "$bs"
+python3 -I -c 'import json,sys; print(json.dumps({"scope":sys.argv[1],"key":"bridge_secret","string_value":open(sys.argv[2]).read().strip()}))' "$SCOPE" "$bs" > "$tmp"
+databricks secrets put-secret --json "@$tmp" --profile "$P"; rm -f "$bs" "$tmp"
 
-state=$(databricks apps get "$APP" --profile "$P" -o json | python3 -I -c 'import sys,json; print((json.load(sys.stdin).get("compute_status") or {}).get("state"))')
-if [ "$state" != "ACTIVE" ]; then echo "   app compute $state -> start (billable)"; databricks apps start "$APP" --profile "$P" >/dev/null; fi
+for i in $(seq 1 80); do  # apps create starts the compute itself: wait while STARTING, start only when STOPPED
+  state=$(databricks apps get "$APP" --profile "$P" -o json | python3 -I -c 'import sys,json; print((json.load(sys.stdin).get("compute_status") or {}).get("state"))')
+  [ "$state" = "ACTIVE" ] && break
+  if [ "$state" = "STOPPED" ]; then echo "   app compute STOPPED -> start (billable)"; databricks apps start "$APP" --profile "$P" >/dev/null; fi
+  [ "$i" = 1 ] && echo "   app compute $state: waiting for ACTIVE (up to 20 min)"
+  sleep 15
+done
+[ "$state" = "ACTIVE" ] || { echo "app compute is $state, not ACTIVE; stop here"; exit 1; }
 databricks apps update "$APP" --profile "$P" --json "{\"name\":\"$APP\",\"resources\":[
  {\"name\":\"pgb-local-password\",\"secret\":{\"scope\":\"$SCOPE\",\"key\":\"pgb_local_password\",\"permission\":\"READ\"}},
- {\"name\":\"webapi-jasypt-key\",\"secret\":{\"scope\":\"$SCOPE\",\"key\":\"webapi_jasypt_key\",\"permission\":\"READ\"}}]}" >/dev/null
+ {\"name\":\"webapi-jasypt-key\",\"secret\":{\"scope\":\"$SCOPE\",\"key\":\"webapi_jasypt_key\",\"permission\":\"READ\"}},
+ {\"name\":\"webapi-bridge-secret\",\"secret\":{\"scope\":\"$SCOPE\",\"key\":\"bridge_secret\",\"permission\":\"READ\"}}]}" >/dev/null
 databricks apps get "$APP" --profile "$P" -o json | python3 -I -c 'import sys,json; print("   resources:", sorted(r["name"] for r in json.load(sys.stdin).get("resources") or []))'
 
 echo "3/3 upload and deploy"
 databricks workspace mkdirs "$DEST" --profile "$P"
-files=(app.yaml launcher.py server.py pgb.py monitors.py requirements.txt)
+files=(app.yaml launcher.py server.py pgb.py monitors.py bridge.py requirements.txt)
 [ -s "$SRC/queries.json" ] && files+=(queries.json)
 for f in "${files[@]}"; do
   databricks workspace import "$DEST/$f" --file "$SRC/$f" --format AUTO --overwrite --profile "$P"
@@ -89,4 +105,4 @@ databricks apps deploy "$APP" --source-code-path "$DEST" --profile "$P" -o json 
 t=sys.stdin.read()
 try: s=json.loads(t).get("status") or {}; print("deploy:", s.get("state"), s.get("message"))
 except ValueError: print(t[:500])'
-echo "done. Check: GET <app url>/ops/status (launcher events, cold_done) and <app url>/WebAPI/info"
+echo "done. Next: README, \"Security\" (python3 -I tools/webapi_admin.py me, then the first admin, the source, the roles)"
