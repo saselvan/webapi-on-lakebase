@@ -7,6 +7,23 @@ the app. Users sign in with workspace single sign-on through the Databricks Apps
 each user gets only the WebAPI rights an admin granted. ATLAS is at `<app url>/atlas/` and signs users in the same
 way.
 
+```mermaid
+flowchart LR
+    U[Browser or script] -->|workspace sign-in| X[Databricks Apps proxy]
+    X -->|X-Forwarded-Email| S
+    subgraph APP[Databricks App]
+        S[server.py<br/>app port] -->|/WebAPI/...| B[bridge.py<br/>one WebAPI token per user]
+        S -->|/atlas/...| A[ATLAS 2.15.0 files]
+        S -->|/ops/... OPS_ADMINS only| O[status, load runs]
+        B --> W[WebAPI 2.15.2<br/>127.0.0.1:8081]
+        W -->|local password| P[PgBouncer 1.26.1<br/>127.0.0.1:6432]
+        R[refresher<br/>app/pgb.py] -->|new token every 900 s| P
+        M[monitors.py] -->|every 60 s, as svc:monitor| B
+    end
+    P -->|service principal OAuth token| L[(Lakebase<br/>WebAPI schema, vocabulary)]
+    M -->|count sessions| L
+```
+
 How the database login works: WebAPI connects to PgBouncer 1.26.1, a connection pooler, on 127.0.0.1:6432 inside the
 app. WebAPI knows only a local PgBouncer password. PgBouncer logs in to Lakebase with an OAuth token for the app's
 service principal. A small refresher (`app/pgb.py`) mints a new token every 900 seconds, rewrites PgBouncer's config
@@ -53,6 +70,27 @@ sequenceDiagram
     S->>W: request + that user's token
     W-->>S: answer, by that user's WebAPI rights
     S-->>B: answer (token headers removed)
+```
+
+How `app/server.py` answers one request (`do_GET`, `_gate`, `_atlas`, `_forward`):
+
+```text
+request
+  path is ambiguous after one decode           -> 400
+  /atlas...
+    no proxy identity                          -> 401
+    ATLAS download failed                      -> 503 + reason
+    /atlas                                     -> 302 /atlas/
+    file not inside the ATLAS folder           -> 404
+    else                                       -> 200 (index.html, config-local.js: no-cache)
+  /ops...
+    identity not in OPS_ADMINS                 -> 404
+    /ops/run|rotate|terminate, OPS_CONTROL off -> 404
+    else                                       -> status or control
+  everything else (/WebAPI/...)
+    WebAPI sign-in path (/user/login ...)      -> 403
+    no proxy identity                          -> 401
+    else: bridge adds that user's WebAPI token -> WebAPI -> answer, token headers removed
 ```
 
 What the code enforces (each item has an offline test, see Tests):
