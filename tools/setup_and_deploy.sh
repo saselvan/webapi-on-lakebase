@@ -9,7 +9,8 @@
 #      temp file and deleted after the put: no copy stays on your machine. App resources pgb-local-password,
 #      webapi-jasypt-key and webapi-bridge-secret point at them.
 #   3. Waits while the app compute is STARTING (apps create starts it), starts it if STOPPED (billable), uploads the
-#      staging folder, deploys. Then follow README, "Security": first admin, source, roles (tools/webapi_admin.py).
+#      staging folder and deploys (tools/deploy.sh: committed code only). Then follow README, "Security": first admin,
+#      source, roles (tools/webapi_admin.py).
 # The app must exist first: databricks apps create <APP_NAME> --profile <DATABRICKS_PROFILE>
 # Stop later: databricks apps stop <APP_NAME> --profile <DATABRICKS_PROFILE>
 # Usage: python3 -I tools/render.py && bash tools/setup_and_deploy.sh [config.env]
@@ -91,18 +92,6 @@ databricks apps update "$APP" --profile "$P" --json "{\"name\":\"$APP\",\"resour
  {\"name\":\"webapi-bridge-secret\",\"secret\":{\"scope\":\"$SCOPE\",\"key\":\"bridge_secret\",\"permission\":\"READ\"}}]}" >/dev/null
 databricks apps get "$APP" --profile "$P" -o json | python3 -I -c 'import sys,json; print("   resources:", sorted(r["name"] for r in json.load(sys.stdin).get("resources") or []))'
 
-echo "3/3 upload and deploy"
-databricks workspace mkdirs "$DEST" --profile "$P"
-files=(app.yaml launcher.py server.py pgb.py monitors.py bridge.py requirements.txt)
-[ -s "$SRC/queries.json" ] && files+=(queries.json)
-for f in "${files[@]}"; do
-  databricks workspace import "$DEST/$f" --file "$SRC/$f" --format AUTO --overwrite --profile "$P"
-done
-databricks workspace import "$DEST/pgbouncer-1.26.1-linux-amd64-static" --file "$SRC/pgbouncer-1.26.1-linux-amd64-static" \
-  --format RAW --overwrite --profile "$P"
-databricks apps deploy "$APP" --source-code-path "$DEST" --profile "$P" -o json \
-  | python3 -I -c 'import sys,json
-t=sys.stdin.read()
-try: s=json.loads(t).get("status") or {}; print("deploy:", s.get("state"), s.get("message"))
-except ValueError: print(t[:500])'
+echo "3/3 upload and deploy (tools/deploy.sh)"
+bash "$(dirname "$0")/deploy.sh" "$CONF"
 echo "done. Next: README, \"Security\" (python3 -I tools/webapi_admin.py me, then the first admin, the source, the roles)"
