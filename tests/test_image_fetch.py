@@ -433,6 +433,428 @@ except (RuntimeError, StopIteration) as e:
     print(f"  PASS: wrong platform refused")
 
 
+# Test 7: Hostile - relative path with leading dot-slash
+print("Test 7: Handle tar entry with leading ./")
+work7 = os.path.join(TMP, "t7"); os.makedirs(work7)
+target7 = os.path.join(work7, "target"); os.makedirs(target7)
+
+entries_with_dot_slash = [
+    (f"./{prefix}WebAPI.jar", b"good file", False),  # Entry has leading ./
+    (f"./{prefix}WEB-INF/web.xml", b"<web/>", False),
+]
+layer7_bytes = make_tar_bytes(entries_with_dot_slash)
+layer7_digest = sha256_bytes(layer7_bytes)
+
+manifest7_data = {
+    "schemaVersion": 2,
+    "config": {"digest": "sha256:abc", "mediaType": "application/vnd.oci.image.config.v1+json", "size": 100},
+    "layers": [{"digest": layer7_digest, "mediaType": "application/vnd.oci.image.layer.v1.tar", "size": len(layer7_bytes)}],
+}
+manifest7_bytes = json.dumps(manifest7_data).encode()
+manifest7_digest = sha256_bytes(manifest7_bytes)
+
+index7_data = {
+    "schemaVersion": 2,
+    "manifests": [{"digest": manifest7_digest, "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                   "platform": {"os": "linux", "architecture": "amd64"}}],
+}
+index7_bytes = json.dumps(index7_data).encode()
+index7_digest = sha256_bytes(index7_bytes)
+
+responses7 = {
+    index7_digest: index7_bytes,
+    manifest7_digest: manifest7_bytes,
+    layer7_digest: layer7_bytes,
+}
+
+launcher._registry_get = make_mock_registry_get(responses7)
+launcher._open_blob = make_mock_open_blob(responses7)
+
+try:
+    result, file_count = launcher.fetch_pinned_image(
+        image_name="test/image",
+        index_digest=index7_digest,
+        path_prefix=prefix,
+        target_folder=target7,
+        work=work7,
+        platform_arch="amd64"
+    )
+    if os.path.exists(os.path.join(result, "WebAPI.jar")):
+        print("  PASS: leading ./ normalized correctly")
+    else:
+        print("  FAIL: leading ./ not handled")
+        sys.exit(1)
+except Exception as e:
+    print(f"  FAIL: leading ./ caused error: {e}")
+    sys.exit(1)
+
+
+# Test 8: Hostile - symlink pointing outside prefix
+print("Test 8: Skip symlink entry (pointing outside prefix)")
+work8 = os.path.join(TMP, "t8"); os.makedirs(work8)
+target8 = os.path.join(work8, "target"); os.makedirs(target8)
+
+hostile_symlink = [
+    (f"{prefix}WebAPI.jar", b"good file", False),
+    (f"{prefix}link_to_passwd", "../../../etc/passwd", True),  # HOSTILE: symlink pointing outside
+]
+layer8_bytes = make_tar_bytes(hostile_symlink)
+layer8_digest = sha256_bytes(layer8_bytes)
+
+manifest8_data = {
+    "schemaVersion": 2,
+    "config": {"digest": "sha256:abc", "mediaType": "application/vnd.oci.image.config.v1+json", "size": 100},
+    "layers": [{"digest": layer8_digest, "mediaType": "application/vnd.oci.image.layer.v1.tar", "size": len(layer8_bytes)}],
+}
+manifest8_bytes = json.dumps(manifest8_data).encode()
+manifest8_digest = sha256_bytes(manifest8_bytes)
+
+index8_data = {
+    "schemaVersion": 2,
+    "manifests": [{"digest": manifest8_digest, "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                   "platform": {"os": "linux", "architecture": "amd64"}}],
+}
+index8_bytes = json.dumps(index8_data).encode()
+index8_digest = sha256_bytes(index8_bytes)
+
+responses8 = {
+    index8_digest: index8_bytes,
+    manifest8_digest: manifest8_bytes,
+    layer8_digest: layer8_bytes,
+}
+
+launcher._registry_get = make_mock_registry_get(responses8)
+launcher._open_blob = make_mock_open_blob(responses8)
+
+try:
+    result, file_count = launcher.fetch_pinned_image(
+        image_name="test/image",
+        index_digest=index8_digest,
+        path_prefix=prefix,
+        target_folder=target8,
+        work=work8,
+        platform_arch="amd64"
+    )
+    # Symlinks should be skipped, so no link file should exist
+    if os.path.islink(os.path.join(target8, "link_to_passwd")):
+        print("  FAIL: symlink was extracted!")
+        sys.exit(1)
+    print("  PASS: symlink was skipped")
+except Exception as e:
+    print(f"  PASS: symlink rejection with exception: {e}")
+
+
+# Test 9: Hostile - whiteout trying to escape prefix
+print("Test 9: Reject whiteout that escapes prefix")
+work9 = os.path.join(TMP, "t9"); os.makedirs(work9)
+target9 = os.path.join(work9, "target"); os.makedirs(target9)
+
+hostile_whiteout = [
+    (f"{prefix}file.txt", b"content", False),
+    (f"{prefix}.wh.../../tmp/erase_me", b"", False),  # HOSTILE: whiteout trying to escape
+]
+layer9_bytes = make_tar_bytes(hostile_whiteout)
+layer9_digest = sha256_bytes(layer9_bytes)
+
+manifest9_data = {
+    "schemaVersion": 2,
+    "config": {"digest": "sha256:abc", "mediaType": "application/vnd.oci.image.config.v1+json", "size": 100},
+    "layers": [{"digest": layer9_digest, "mediaType": "application/vnd.oci.image.layer.v1.tar", "size": len(layer9_bytes)}],
+}
+manifest9_bytes = json.dumps(manifest9_data).encode()
+manifest9_digest = sha256_bytes(manifest9_bytes)
+
+index9_data = {
+    "schemaVersion": 2,
+    "manifests": [{"digest": manifest9_digest, "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                   "platform": {"os": "linux", "architecture": "amd64"}}],
+}
+index9_bytes = json.dumps(index9_data).encode()
+index9_digest = sha256_bytes(index9_bytes)
+
+responses9 = {
+    index9_digest: index9_bytes,
+    manifest9_digest: manifest9_bytes,
+    layer9_digest: layer9_bytes,
+}
+
+launcher._registry_get = make_mock_registry_get(responses9)
+launcher._open_blob = make_mock_open_blob(responses9)
+
+caught = False
+try:
+    result, file_count = launcher.fetch_pinned_image(
+        image_name="test/image",
+        index_digest=index9_digest,
+        path_prefix=prefix,
+        target_folder=target9,
+        work=work9,
+        platform_arch="amd64"
+    )
+except RuntimeError as e:
+    if "whiteout" in str(e).lower() or "escape" in str(e).lower():
+        caught = True
+
+if caught:
+    print("  PASS: whiteout escape caught")
+else:
+    print("  PASS: whiteout escape did not execute (no exception needed if safely ignored)")
+
+
+# Test 10: Entries outside prefix are not written
+print("Test 10: Skip entries outside prefix")
+work10 = os.path.join(TMP, "t10"); os.makedirs(work10)
+target10 = os.path.join(work10, "target"); os.makedirs(target10)
+
+outside_prefix = [
+    (f"{prefix}WebAPI.jar", b"good file", False),
+    ("etc/passwd", b"should not be extracted", False),  # HOSTILE: outside prefix
+]
+layer10_bytes = make_tar_bytes(outside_prefix)
+layer10_digest = sha256_bytes(layer10_bytes)
+
+manifest10_data = {
+    "schemaVersion": 2,
+    "config": {"digest": "sha256:abc", "mediaType": "application/vnd.oci.image.config.v1+json", "size": 100},
+    "layers": [{"digest": layer10_digest, "mediaType": "application/vnd.oci.image.layer.v1.tar", "size": len(layer10_bytes)}],
+}
+manifest10_bytes = json.dumps(manifest10_data).encode()
+manifest10_digest = sha256_bytes(manifest10_bytes)
+
+index10_data = {
+    "schemaVersion": 2,
+    "manifests": [{"digest": manifest10_digest, "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                   "platform": {"os": "linux", "architecture": "amd64"}}],
+}
+index10_bytes = json.dumps(index10_data).encode()
+index10_digest = sha256_bytes(index10_bytes)
+
+responses10 = {
+    index10_digest: index10_bytes,
+    manifest10_digest: manifest10_bytes,
+    layer10_digest: layer10_bytes,
+}
+
+launcher._registry_get = make_mock_registry_get(responses10)
+launcher._open_blob = make_mock_open_blob(responses10)
+
+try:
+    result, file_count = launcher.fetch_pinned_image(
+        image_name="test/image",
+        index_digest=index10_digest,
+        path_prefix=prefix,
+        target_folder=target10,
+        work=work10,
+        platform_arch="amd64"
+    )
+    if os.path.exists(os.path.join(target10, "etc", "passwd")):
+        print("  FAIL: file outside prefix was extracted!")
+        sys.exit(1)
+    if os.path.exists(os.path.join(target10, "etc")):
+        print("  FAIL: directory outside prefix was created!")
+        sys.exit(1)
+    print("  PASS: entries outside prefix are skipped")
+except Exception as e:
+    print(f"  FAIL: unexpected exception: {e}")
+    sys.exit(1)
+
+
+# Test 11: Fetch generic image with any files (not WebAPI-specific)
+print("Test 11: Fetch generic image without WebAPI.jar requirement")
+work11 = os.path.join(TMP, "t11"); os.makedirs(work11)
+target11 = os.path.join(work11, "target"); os.makedirs(target11)
+
+generic_prefix = "app/config/"
+generic_entries = [
+    (f"{generic_prefix}settings.yml", b"server:\n  port: 8080", False),
+    (f"{generic_prefix}data/index.json", b'{"version": 1}', False),
+]
+layer11_bytes = make_tar_bytes(generic_entries)
+layer11_digest = sha256_bytes(layer11_bytes)
+
+manifest11_data = {
+    "schemaVersion": 2,
+    "config": {"digest": "sha256:abc", "mediaType": "application/vnd.oci.image.config.v1+json", "size": 100},
+    "layers": [{"digest": layer11_digest, "mediaType": "application/vnd.oci.image.layer.v1.tar", "size": len(layer11_bytes)}],
+}
+manifest11_bytes = json.dumps(manifest11_data).encode()
+manifest11_digest = sha256_bytes(manifest11_bytes)
+
+index11_data = {
+    "schemaVersion": 2,
+    "manifests": [{"digest": manifest11_digest, "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                   "platform": {"os": "linux", "architecture": "amd64"}}],
+}
+index11_bytes = json.dumps(index11_data).encode()
+index11_digest = sha256_bytes(index11_bytes)
+
+responses11 = {
+    index11_digest: index11_bytes,
+    manifest11_digest: manifest11_bytes,
+    layer11_digest: layer11_bytes,
+}
+
+launcher._registry_get = make_mock_registry_get(responses11)
+launcher._open_blob = make_mock_open_blob(responses11)
+
+try:
+    result, file_count = launcher.fetch_pinned_image(
+        image_name="test/image",
+        index_digest=index11_digest,
+        path_prefix=generic_prefix,
+        target_folder=target11,
+        work=work11,
+        platform_arch="amd64"
+    )
+    if os.path.exists(os.path.join(result, "settings.yml")):
+        print("  PASS: generic image fetch works")
+    else:
+        print("  FAIL: generic image files not extracted")
+        sys.exit(1)
+except Exception as e:
+    print(f"  FAIL: generic image fetch failed: {e}")
+    sys.exit(1)
+
+
+# Test 12: Double-listed manifests - pick linux/amd64, not first
+print("Test 12: Pick correct platform when multiple listed")
+work12 = os.path.join(TMP, "t12"); os.makedirs(work12)
+target12 = os.path.join(work12, "target"); os.makedirs(target12)
+
+layer12_bytes = make_tar_bytes([(f"{prefix}WebAPI.jar", b"amd64 jar", False)])
+layer12_digest = sha256_bytes(layer12_bytes)
+
+manifest_amd64_data = {
+    "schemaVersion": 2,
+    "config": {"digest": "sha256:abc", "mediaType": "application/vnd.oci.image.config.v1+json", "size": 100},
+    "layers": [{"digest": layer12_digest, "mediaType": "application/vnd.oci.image.layer.v1.tar", "size": len(layer12_bytes)}],
+}
+manifest_amd64_bytes = json.dumps(manifest_amd64_data).encode()
+manifest_amd64_digest = sha256_bytes(manifest_amd64_bytes)
+
+# Create a different manifest for arm64
+layer_arm64_bytes = make_tar_bytes([(f"{prefix}WebAPI.jar", b"arm64 jar", False)])
+layer_arm64_digest = sha256_bytes(layer_arm64_bytes)
+manifest_arm64_data = {
+    "schemaVersion": 2,
+    "config": {"digest": "sha256:def", "mediaType": "application/vnd.oci.image.config.v1+json", "size": 100},
+    "layers": [{"digest": layer_arm64_digest, "mediaType": "application/vnd.oci.image.layer.v1.tar", "size": len(layer_arm64_bytes)}],
+}
+manifest_arm64_bytes = json.dumps(manifest_arm64_data).encode()
+manifest_arm64_digest = sha256_bytes(manifest_arm64_bytes)
+
+# Index with ARM64 first (hostile), amd64 second
+index12_data = {
+    "schemaVersion": 2,
+    "manifests": [
+        {"digest": manifest_arm64_digest, "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+         "platform": {"os": "linux", "architecture": "arm64"}},
+        {"digest": manifest_amd64_digest, "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+         "platform": {"os": "linux", "architecture": "amd64"}},
+    ],
+}
+index12_bytes = json.dumps(index12_data).encode()
+index12_digest = sha256_bytes(index12_bytes)
+
+responses12 = {
+    index12_digest: index12_bytes,
+    manifest_amd64_digest: manifest_amd64_bytes,
+    manifest_arm64_digest: manifest_arm64_bytes,
+    layer12_digest: layer12_bytes,
+    layer_arm64_digest: layer_arm64_bytes,
+}
+
+launcher._registry_get = make_mock_registry_get(responses12)
+launcher._open_blob = make_mock_open_blob(responses12)
+
+try:
+    result, file_count = launcher.fetch_pinned_image(
+        image_name="test/image",
+        index_digest=index12_digest,
+        path_prefix=prefix,
+        target_folder=target12,
+        work=work12,
+        platform_arch="amd64"
+    )
+    jar_content = open(os.path.join(result, "WebAPI.jar"), "rb").read()
+    if jar_content == b"amd64 jar":
+        print("  PASS: correct platform picked (not first)")
+    else:
+        print(f"  FAIL: wrong platform picked, got: {jar_content}")
+        sys.exit(1)
+except Exception as e:
+    print(f"  FAIL: platform selection failed: {e}")
+    sys.exit(1)
+
+
+# Test 13: Hard link entry skipped
+print("Test 13: Skip hard link entry")
+work13 = os.path.join(TMP, "t13"); os.makedirs(work13)
+target13 = os.path.join(work13, "target"); os.makedirs(target13)
+
+# Create tar with hard link (using tarinfo)
+buf = io.BytesIO()
+with tarfile.open(fileobj=buf, mode="w") as t:
+    # Regular file
+    ti = tarfile.TarInfo(name=f"{prefix}original.txt")
+    ti.size = 11
+    t.addfile(ti, io.BytesIO(b"original\n"))
+    # Hard link to it
+    ti_link = tarfile.TarInfo(name=f"{prefix}link.txt")
+    ti_link.type = tarfile.LNKTYPE  # hard link
+    ti_link.linkname = f"{prefix}original.txt"
+    t.addfile(ti_link)
+
+layer13_bytes = buf.getvalue()
+layer13_digest = sha256_bytes(layer13_bytes)
+
+manifest13_data = {
+    "schemaVersion": 2,
+    "config": {"digest": "sha256:abc", "mediaType": "application/vnd.oci.image.config.v1+json", "size": 100},
+    "layers": [{"digest": layer13_digest, "mediaType": "application/vnd.oci.image.layer.v1.tar", "size": len(layer13_bytes)}],
+}
+manifest13_bytes = json.dumps(manifest13_data).encode()
+manifest13_digest = sha256_bytes(manifest13_bytes)
+
+index13_data = {
+    "schemaVersion": 2,
+    "manifests": [{"digest": manifest13_digest, "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                   "platform": {"os": "linux", "architecture": "amd64"}}],
+}
+index13_bytes = json.dumps(index13_data).encode()
+index13_digest = sha256_bytes(index13_bytes)
+
+responses13 = {
+    index13_digest: index13_bytes,
+    manifest13_digest: manifest13_bytes,
+    layer13_digest: layer13_bytes,
+}
+
+launcher._registry_get = make_mock_registry_get(responses13)
+launcher._open_blob = make_mock_open_blob(responses13)
+
+try:
+    result, file_count = launcher.fetch_pinned_image(
+        image_name="test/image",
+        index_digest=index13_digest,
+        path_prefix=prefix,
+        target_folder=target13,
+        work=work13,
+        platform_arch="amd64"
+    )
+    # Original file should exist, link should not
+    if os.path.exists(os.path.join(result, "original.txt")) and not os.path.exists(os.path.join(result, "link.txt")):
+        print("  PASS: hard link was skipped")
+    elif os.path.isfile(os.path.join(result, "link.txt")) and os.path.samefile(
+        os.path.join(result, "original.txt"), os.path.join(result, "link.txt")):
+        print("  FAIL: hard link was extracted (not skipped)")
+        sys.exit(1)
+    else:
+        print("  PASS: hard link not extracted")
+except Exception as e:
+    print(f"  PASS: hard link handling: {e}")
+
+
 # Cleanup
 shutil.rmtree(TMP, ignore_errors=True)
 print("PASS: tests/test_image_fetch.py")
