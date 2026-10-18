@@ -98,6 +98,65 @@ def make_mock_open_blob(responses):
     return mock_open_blob
 
 
+# Test 0: Index digest must be validated
+print("Test 0: Reject index with wrong digest")
+work0 = os.path.join(TMP, "t0"); os.makedirs(work0)
+target0 = os.path.join(work0, "target"); os.makedirs(target0)
+
+prefix = "var/lib/ohdsi/webapi/"
+layer_entries = [
+    ("var/lib/ohdsi/webapi/WebAPI.jar", b"fake jar content", False),
+]
+layer_bytes = make_tar_bytes(layer_entries)
+layer_digest = sha256_bytes(layer_bytes)
+
+manifest_data = {
+    "schemaVersion": 2,
+    "config": {"digest": "sha256:abc123", "mediaType": "application/vnd.oci.image.config.v1+json", "size": 100},
+    "layers": [{"digest": layer_digest, "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "size": len(layer_bytes)}],
+}
+manifest_bytes = json.dumps(manifest_data).encode()
+manifest_digest = sha256_bytes(manifest_bytes)
+
+index_data = {
+    "schemaVersion": 2,
+    "manifests": [
+        {"digest": manifest_digest, "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+         "platform": {"os": "linux", "architecture": "amd64"}},
+    ],
+}
+index_bytes = json.dumps(index_data).encode()
+correct_index_digest = sha256_bytes(index_bytes)
+wrong_index_digest = "sha256:" + "9" * 64  # HOSTILE: wrong index digest
+
+responses0 = {
+    wrong_index_digest: index_bytes,  # use wrong digest as key
+    manifest_digest: manifest_bytes,
+    layer_digest: layer_bytes,
+}
+
+launcher._registry_get = make_mock_registry_get(responses0)
+launcher._open_blob = make_mock_open_blob(responses0)
+
+try:
+    result, file_count = launcher.fetch_pinned_image(
+        image_name="test/image",
+        index_digest=wrong_index_digest,
+        path_prefix=prefix,
+        target_folder=target0,
+        work=work0,
+        platform_arch="amd64"
+    )
+    print("  FAIL: index digest mismatch was not caught!")
+    sys.exit(1)
+except RuntimeError as e:
+    if "digest" in str(e).lower():
+        print(f"  PASS: index digest mismatch caught")
+    else:
+        print(f"  FAIL: unexpected error: {e}")
+        sys.exit(1)
+
+
 # Test 1: Valid pinned image fetch (baseline)
 print("Test 1: Valid pinned image fetch")
 work1 = os.path.join(TMP, "t1"); os.makedirs(work1)
