@@ -101,7 +101,7 @@ def _raises(fn, exc=Exception):
 def reset():
     """Each section starts clean: WebAPI forgets its tokens and the front server gets a new bridge (empty cache)."""
     Fake.logins.clear(); Fake.seen.clear(); Fake.tokens.clear()
-    server.BRIDGE = bridge.Bridge(java_port, SECRET)
+    server.BRIDGE = bridge.Bridge(server.JAVA_PORT, SECRET)
 
 
 # A2: no identity -> 401 and WebAPI is never asked
@@ -259,8 +259,9 @@ class FakeWebAPIRefresh(http.server.BaseHTTPRequestHandler):
                 Fake.n += 1; tok = f"tok-{Fake.n}"; Fake.tokens[tok] = form["login"]; Fake.logins.append(form["login"])
             return self._send(200, {"ok": True}, [("Bearer", tok)])
 
-        # /user/refresh: rotate the token and return new token in Bearer header
-        if self.path == "/WebAPI/user/refresh":
+        # /user/refresh: normalize path (case, trailing slash, query string) and handle refresh
+        normalized_path = urllib.parse.unquote(self.path.split("?", 1)[0]).lower().rstrip("/")
+        if normalized_path == "/webapi/user/refresh":
             auth = self.headers.get("Authorization", "")
             user = Fake.tokens.get(auth[7:]) if auth.startswith("Bearer ") else None
             Fake.seen.append({"method": self.command, "path": self.path, "user": user, "auth": auth})
@@ -359,6 +360,49 @@ other_tok = next(t for t, u in Fake.tokens.items() if u == OTHER)
 call("GET", "/WebAPI/info", OWNER)  # Create OWNER token
 st, _, body = call("GET", "/WebAPI/user/refresh", OWNER, {"Authorization": f"Bearer {other_tok}"})
 check("A18 forged auth on refresh: uses caller's identity", st == 200, st)
+
+# A19: /user/refresh with 401 (expired token) -> drop token, one fresh login, one refresh; never a loop
+reset()
+Fake.grace_period = {}
+call("GET", "/WebAPI/info", OWNER)  # Login once
+old_tok = next(t for t, u in Fake.tokens.items() if u == OWNER)
+# Make the cached token invalid
+del Fake.tokens[old_tok]
+# Refresh should: drop the expired token, login fresh, then refresh
+st, _, body = call("GET", "/WebAPI/user/refresh", OWNER)
+check("A19 refresh with expired token: succeeds (not 401)", st == 200, st)
+# Should have: 1 original login + 1 fresh login
+logins_owner = Fake.logins.count(OWNER)
+check("A19 expired token -> exactly one re-login then refresh", logins_owner == 2, (logins_owner, Fake.logins))
+
+# A20-A25: /user/refresh spellings: case, trailing /, encoded /, query string
+reset()
+Fake.grace_period = {}
+call("GET", "/WebAPI/info", OWNER)
+spellings_refresh = ["/WebAPI/user/refresh", "/WebAPI/USER/REFRESH", "/WebAPI/user/refresh/",
+                     "/WebAPI/user%2Frefresh", "/WebAPI/user/refresh?x=1"]
+for i, spelling in enumerate(spellings_refresh, 20):
+    reset()
+    Fake.grace_period = {}
+    call("GET", "/WebAPI/info", OWNER)  # Login first
+    old_tok = next(t for t, u in Fake.tokens.items() if u == OWNER)
+    st, _, _ = call("GET", spelling, OWNER)
+    # Check we got 200 and the token was refreshed (new token in next request)
+    if st == 200:
+        st2, _, _ = call("GET", "/WebAPI/info", OWNER)
+        has_new_tok = Fake.seen[-1]["auth"] != f"Bearer {old_tok}" if Fake.seen[-1]["auth"].startswith("Bearer ") else False
+        check(f"A{i} {spelling}: refresh succeeds with new token", st2 == 200 and has_new_tok, (st, st2, has_new_tok, Fake.seen[-1]))
+    else:
+        check(f"A{i} {spelling}: should be 200", False, st)
+
+# A26: refresh response body (permissions JSON) is returned, but no token text in it
+reset()
+Fake.grace_period = {}
+call("GET", "/WebAPI/info", OWNER)
+st, _, body = call("GET", "/WebAPI/user/refresh", OWNER)
+body_str = body.decode() if isinstance(body, bytes) else body
+check("A26 refresh body: JSON with permissions, no token text", st == 200 and '"permissions"' in body_str and "tok-" not in body_str and "leak-" not in body_str,
+      body_str[:100])
 
 # Launcher: security settings fail closed; the raw secret never reaches Java's environment
 import bcrypt  # noqa: E402

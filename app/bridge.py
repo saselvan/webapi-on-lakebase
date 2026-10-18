@@ -107,30 +107,42 @@ class Bridge:
                 del self._tokens[ident]
 
     def _refresh(self, ident):
-        """Refresh the token for ident by calling /user/refresh, cache the new token, return (status, hdrs, body)."""
+        """Refresh the token for ident by calling /user/refresh, cache the new token, return (status, hdrs, body).
+
+        WebAPI's /user/refresh returns the user's permissions JSON in the body (only a Bearer header has the token).
+        If WebAPI answers 401 (cached token expired or key rotated away), drop the token, do one fresh login,
+        then try refresh once more. Never retry after a second 401.
+        """
         tok = self.token(ident)  # Get current token; blocks on concurrent refresh for same identity
-        out = {"Authorization": f"Bearer {tok}"}
-        c = self._conn()
-        try:
-            c.request("GET", "/WebAPI/user/refresh", b"", out)
-            r = c.getresponse(); data = r.read()
-            hdrs = [(k, v) for k, v in r.getheaders() if k.lower() not in STRIP_RESPONSE]
-            new_tok = r.getheader("Bearer")
-        finally:
-            c.close()
-        if r.status == 200 and new_tok:
-            with self._lock:
-                self._tokens[ident] = new_tok
-            self.stats["refreshes"] += 1
+        for attempt in (0, 1):
+            out = {"Authorization": f"Bearer {tok}"}
+            c = self._conn()
+            try:
+                c.request("GET", "/WebAPI/user/refresh", b"", out)
+                r = c.getresponse(); data = r.read()
+                hdrs = [(k, v) for k, v in r.getheaders() if k.lower() not in STRIP_RESPONSE]
+                new_tok = r.getheader("Bearer")
+            finally:
+                c.close()
+            if r.status != 401 or attempt:  # On 401, only retry once
+                if r.status == 200 and new_tok:
+                    with self._lock:
+                        self._tokens[ident] = new_tok
+                    self.stats["refreshes"] += 1
+                return r.status, hdrs, data
+            # 401: drop cached token and get a fresh one for the retry
+            self.drop(ident, tok)
+            tok = self.token(ident, fresh=True)
         return r.status, hdrs, data
 
     def request(self, method, target, body, headers, ident):
         """Forward one request to WebAPI as ident. Returns (status, [(header, value)], body bytes).
 
         If target is /user/refresh, calls _refresh which updates the cache with the new token.
+        Path matching is case-insensitive and ignores trailing slashes.
         """
         path = normalize_path(target) or target
-        if path.lower() == REFRESH_PATH:
+        if path.lower().rstrip("/") == REFRESH_PATH:
             return self._refresh(ident)
 
         out = {k: v for k, v in headers.items() if k.lower() != "authorization"}
