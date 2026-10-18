@@ -1,10 +1,11 @@
 # OHDSI WebAPI on Lakebase, as a Databricks App
 
-This repo runs OHDSI WebAPI 2.15.2 as a Databricks App. WebAPI keeps its own tables and reads an OMOP vocabulary in
+This repo runs OHDSI WebAPI 2.15.2 and the ATLAS 2.15.0 web app as one Databricks App. WebAPI keeps its own tables and reads an OMOP vocabulary in
 Lakebase, the managed Postgres in Databricks. It logs in as the app's service principal (the app's Databricks
 identity), so no database password is stored. The only password is a local one between WebAPI and PgBouncer, inside
 the app. Users sign in with workspace single sign-on through the Databricks Apps proxy, and WebAPI security is on:
-each user gets only the WebAPI rights an admin granted.
+each user gets only the WebAPI rights an admin granted. ATLAS is at `<app url>/atlas/` and signs users in the same
+way.
 
 How the database login works: WebAPI connects to PgBouncer 1.26.1, a connection pooler, on 127.0.0.1:6432 inside the
 app. WebAPI knows only a local PgBouncer password. PgBouncer logs in to Lakebase with an OAuth token for the app's
@@ -57,11 +58,16 @@ sequenceDiagram
 What the code enforces (each item has an offline test, see Tests):
 
 - A request without a proxy identity gets 401 and never reaches WebAPI.
-- WebAPI's own sign-in paths (`/user/login`, `/user/runas`, `/user/oauth`, `/user/saml`, `/user/cas`, `/user/refresh`,
+- WebAPI's own sign-in paths (`/user/login`, `/user/runas`, `/user/oauth`, `/user/saml`, `/user/cas`,
   `/user/logout`) get 403 from outside, in every spelling the tests try (case, trailing `/`, `%2F`, double encoding,
   `;`, `//`, `/./`, `/../`). A path that is ambiguous after one decode gets 400.
 - A client's `Authorization` header is always replaced. Each user has their own WebAPI token. After a WebAPI 401 the
   bridge logs in one more time, never in a loop.
+- `/user/refresh` (ATLAS calls it after each 403) is done by the bridge for the signed-in user: it sends that user's
+  token, keeps the new token WebAPI returns, and passes on only the body (the user's rights). After a 401 it logs in
+  once more and tries once more, never in a loop. Every spelling of the path reaches this handler.
+- `/atlas/...` needs a proxy identity (401 without one), gets the same path checks (400 for an ambiguous path), and
+  serves only files inside the ATLAS folder after symlinks are followed (404 for anything else).
 - WebAPI's token and cookie headers are removed from every answer. The bridge secret is in no log line and no answer.
 - `/ops/*` answers only the identities in `OPS_ADMINS` (404 for everyone else). The controls (`/ops/run`,
   `/ops/rotate`, `/ops/terminate`) also need `OPS_CONTROL=on`.
@@ -76,27 +82,48 @@ WebAPI rules you meet once (read from the pinned image's migrations, then checke
 - An admin has no rights on a new source. WebAPI makes a role `Source user (<key>)` for each source; add users to it.
 - An admin can create roles and add users to roles by REST (`PUT /WebAPI/role/{roleId}/users/{userId}`), but can add
   rights by REST only to the public role. So a narrow role gets its rights by SQL (`tools/webapi_admin.py role-perm`).
+- WebAPI's `admin` role cannot create concept sets. WebAPI's built-in role `Atlas users` holds the rights to create
+  them; without it, ATLAS shows the name box as read-only and WebAPI answers 403. Add each ATLAS user to it.
 - Workspace groups are not mapped to WebAPI roles. A user appears in WebAPI after their first request.
+
+## ATLAS
+
+The launcher downloads ATLAS 2.15.0 from the `ohdsi/atlas` image on Docker Hub, pinned by index digest, with the
+manifest and every layer checked by SHA-256, the same way as WebAPI. It takes only the ATLAS folder from the layers
+and refuses a layer entry that would land outside it. Then it replaces the image's `js/config-local.js` with its own
+(`ATLAS_CONFIG` in `app/launcher.py`):
+
+- WebAPI is this app's `/WebAPI/`, on the app's own address.
+- Sign-in is on, with no login providers. ATLAS asks `/WebAPI/user/me`, and the bridge answers as the user the proxy
+  signed in. Users never see an ATLAS login form, and ATLAS shows only the actions that user's WebAPI rights allow.
+- The front server sends `index.html` and `config-local.js` with `Cache-Control: no-cache`, so a browser gets a new
+  config after each deploy.
+
+If the ATLAS download fails, WebAPI still starts, `/atlas/` answers 503 with the reason, and the launcher logs an
+`atlas_error` event in `/ops/status`.
 
 ## How the code is laid out
 
 ```text
 webapi-on-lakebase/
 ├── app/                         # runs inside the Databricks App
-│   ├── launcher.py              # entry point: gets Java and WebAPI, starts PgBouncer, checks security, starts WebAPI
+│   ├── launcher.py              # entry point: gets Java, WebAPI and ATLAS, starts PgBouncer, checks security, WebAPI
 │   ├── pgb.py                   # PgBouncer process and the token refresher
 │   ├── bridge.py                # proxy identity -> WebAPI login, and the request gate
-│   ├── server.py                # front server on the app port: /WebAPI/... (through the bridge) and /ops/...
+│   ├── server.py                # front server on the app port: /WebAPI/... (through the bridge), /atlas/..., /ops/...
 │   ├── monitors.py              # every 60 s: checks WebAPI, counts Lakebase sessions
 │   ├── app.yaml.template        # app settings, with __PLACEHOLDERS__
 │   └── requirements.txt
 ├── pgbouncer/Dockerfile.static  # builds PgBouncer 1.26.1 as one static binary
 ├── tools/                       # runs on your laptop
 │   ├── render.py                # checks config, security settings and binary hash, stages the app outside the repo
-│   ├── setup_and_deploy.sh      # Postgres role and grants, 3 secrets, upload, deploy
+│   ├── setup_and_deploy.sh      # Postgres role and grants, 3 secrets, then deploy.sh
+│   ├── deploy.sh                # upload and deploy, committed code only (also for a new version)
+│   ├── check.sh                 # runs every offline test
 │   ├── webapi_admin.py          # first admin, the vocabulary source, roles, checks
 │   └── teardown.sh              # removes what setup made, then checks
-├── tests/                       # offline: test_app.py, test_bridge.py, test_render.py
+├── tests/                       # offline: test_app, test_bridge, test_render, test_atlas, test_image_fetch
+├── .github/workflows/check.yml  # runs tools/check.sh on each push
 └── config.env.example           # your settings
 ```
 
@@ -106,6 +133,7 @@ What happens when the app starts (`app/launcher.py`, `main`):
 main
   fetch_jre                  # Temurin 8 JRE, SHA-256 checked
   fetch_webapi               # WebAPI 2.15.2 image from Docker Hub, manifest and every layer checked by digest
+  fetch_atlas                # ATLAS 2.15.0 image the same way, then the generated config-local.js; on error: None
   start_pgbouncer            # APP_DB=pgbouncer
     check the binary's SHA-256 against PGB_SHA256   # refuses to start if unset or different
     PgBouncer.start
@@ -116,7 +144,7 @@ main
     bridge_env               # new bcrypt hash of BRIDGE_SECRET -> WebAPI's database-login query; secret removed
   start WebAPI               # Java on 127.0.0.1:8081, local password, URL 127.0.0.1:6432/webapi
   Monitors.start             # ticker and session sampler, every 60 s, through the bridge
-  server.serve               # app port: /WebAPI through the bridge, /ops for OPS_ADMINS
+  server.serve               # app port: /WebAPI through the bridge, /atlas, /ops for OPS_ADMINS
 ```
 
 ## What was tested, and what this copy is
@@ -167,7 +195,7 @@ This copy, deployed as committed to a new app on the same Lakebase project (auto
 `config.env` filled in and no code changed:
 
 - `render.py` and `setup_and_deploy.sh` worked as written. Flyway: 202 rows, 202 succeeded.
-- The 8 calls of step 5 below worked in that order, plus `role-add "Source user (<SOURCE_KEY>)" svc:monitor`.
+- The 8 calls of step 5 below (all but `Atlas users`) worked in that order, plus `role-add "Source user (<SOURCE_KEY>)" svc:monitor`.
   `forged` printed the signed-in user's login twice. 8 WebAPI sign-in paths got 403 through the app.
 - Load with security on: 1, 8 and 32 users, each with a 30 s warm-up and 180 s measured, one forced token change per
   level, click path search, concept, `ancestorAndDescendant`, all through the bridge. 2,898 samples, every response
@@ -177,14 +205,30 @@ This copy, deployed as committed to a new app on the same Lakebase project (auto
   (not measured) had 1 client timeout on the first search of a cold vocabulary.
 - 0 tokens and 0 copies of the local password in the saved results and in the app log (468 lines).
 
+ATLAS, in the same app, deployed with `tools/deploy.sh` (it printed that the uploaded files match the commit):
+
+- The launcher fetched ATLAS from the pinned image (24,393 files) with no `atlas_error`. WebAPI was ready in 28.7 s.
+- `/atlas/js/config-local.js` was byte for byte the committed config, sent with `no-cache`.
+- In Chrome, signed in through the proxy: ATLAS showed the user's email and no login form. A search for `diabetes`
+  gave 50 rows, concept 201826 (`Type 2 diabetes mellitus`) opened with its hierarchy, and a saved concept set was
+  in WebAPI's schema afterwards. The first try of the save got 403 until the user was in `Atlas users` (step 5).
+- `/user/refresh` through the proxy: 200, no token in the answer, and the next request worked with no new login.
+- With no sign-in, `/atlas/` and `/WebAPI/info` got only the proxy's redirect to the workspace sign-in.
+- Browser console: 0 failed `/WebAPI/` calls. 3 errors with 404: `js/config-gis.js` (ATLAS loads it only if it
+  exists) and 2 record-count calls (record counts need a source with a results schema; the test source had the
+  vocabulary only).
+- 0 tokens, 0 copies of the local password and 0 bcrypt hashes in the saved results and in the app log (202 lines).
+- Offline: 5 test files pass, and 94 of 94 deliberate code breaks each made a check fail.
+
 ## What was not tested
 
-- The ATLAS web app in a browser. The tested requests were REST calls through the proxy and from inside the app.
+- ATLAS with more than one user at the same time, and ATLAS features that need a results schema (record counts,
+  cohort generation, characterizations).
 - A long run (hours) with security on, a simulated connection close with security on, and more than 32 users.
 - Changing the bridge secret while users are signed in.
 - A real close at the 3-day maximum connection life (only simulated, above).
 - Rotation of the app service principal's own credentials.
-- Downloads staged in a Unity Catalog volume. The launcher fetches the JRE and the WebAPI image from the internet.
+- Downloads staged in a Unity Catalog volume. The launcher fetches the JRE, the WebAPI image and the ATLAS image from the internet.
 
 ## Why PgBouncer 1.26.1 or later
 
@@ -199,8 +243,8 @@ and this setup uses `auth_type = scram-sha-256`.
 - Your OMOP vocabulary tables or views in one schema on that Lakebase project.
 - You are the Lakebase project owner. The scripts log in as you to create the app's role and grants, and to set the
   first WebAPI admin.
-- `psql`, Python 3 with `psycopg[binary]` (for `webapi_admin.py grant` and `role-perm`), and Docker (to build
-  PgBouncer).
+- `psql`, Python 3 with `psycopg[binary]` (for `webapi_admin.py grant` and `role-perm`), Docker (to build
+  PgBouncer), and `uv` to run the tests.
 
 ## Steps
 
@@ -210,7 +254,7 @@ flowchart LR
     B --> C[render.py<br/>checks and stage]
     C --> D[setup_and_deploy.sh<br/>role, secrets, deploy]
     D --> E[webapi_admin.py<br/>admin, source, roles]
-    E --> F[GET /ops/status]
+    E --> F[GET /ops/status<br/>open /atlas/]
 ```
 
 1. Build PgBouncer as one static linux/amd64 binary. The build checks the source tarball's published SHA-256.
@@ -244,6 +288,7 @@ flowchart LR
    python3 -I tools/webapi_admin.py grant <your email> admin             # the first admin (SQL)
    python3 -I tools/webapi_admin.py source-add                           # source SOURCE_KEY on VOCAB_SCHEMA
    python3 -I tools/webapi_admin.py role-add "Source user (<SOURCE_KEY>)" <your email>
+   python3 -I tools/webapi_admin.py role-add "Atlas users" <your email>  # ATLAS create rights (concept sets)
    python3 -I tools/webapi_admin.py role-create Monitor                  # a narrow role for the in-app ticker
    python3 -I tools/webapi_admin.py role-perm Monitor conceptset:get
    python3 -I tools/webapi_admin.py role-add Monitor svc:monitor
@@ -252,24 +297,28 @@ flowchart LR
 
    If you set `TICK_CONCEPT_ID` or use the load runner, also add `svc:monitor` to the source's role:
    `role-add "Source user (<SOURCE_KEY>)" svc:monitor`. For each other user: they open the app once, then you add
-   them to the roles they need, for example `role-add "Source user (<SOURCE_KEY>)" <their email>`.
+   them to the roles they need, for example `role-add "Source user (<SOURCE_KEY>)" <their email>` and
+   `role-add "Atlas users" <their email>`.
 
 6. Check `GET <app url>/ops/status`: the launcher events (token, PgBouncer listening, bridge, Java start),
    `cold_done` and the bridge's login counts. `GET <app url>/ops/conn` shows the refresher, the in-app checks every
    60 s, and the Lakebase session counts. The in-app load runner needs your own `queries.json` (set `QUERIES_JSON`)
-   and `OPS_CONTROL=on`; without them `/ops/run` answers 404.
+   and `OPS_CONTROL=on`; without them `/ops/run` answers 404. Then open `<app url>/atlas/`.
+
+7. To deploy a new version later (no schema, secret or resource change): commit, then
+   `python3 -I tools/render.py && bash tools/deploy.sh`. It stops if a staged app file differs from the commit.
 
 ## Tests
 
 ```
-pip install -r app/requirements.txt
-python3 -I tests/test_app.py
-python3 -I tests/test_bridge.py
-python3 -I tests/test_render.py
+bash tools/check.sh
 ```
 
-All three run offline, with no Databricks, Lakebase or Java. `tests/test_bridge.py` runs the real front server and
-bridge against a fake WebAPI, with checks for each item of the security list above.
+It runs the 5 test files in `tests/` with pinned test packages (through `uv`), and checks the shell scripts. CI runs it
+on each push. All tests run offline, with no Databricks, Lakebase or Java. `tests/test_bridge.py` runs the real front server and
+bridge against a fake WebAPI, with checks for each item of the security list above. `tests/test_atlas.py` runs the
+front server on a fake ATLAS tree with hostile files (a config that turns sign-in off, symlinks out of the tree), and
+`tests/test_image_fetch.py` feeds the image download hostile layers (`..`, absolute paths, whiteouts, wrong digests).
 
 ## Teardown
 
