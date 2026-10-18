@@ -787,25 +787,17 @@ except Exception as e:
     sys.exit(1)
 
 
-# Test 13: Hard link entry skipped
-print("Test 13: Skip hard link entry")
+# Test 13: File outside prefix with absolute reference
+print("Test 13: Reject absolute references in prefix filter")
 work13 = os.path.join(TMP, "t13"); os.makedirs(work13)
 target13 = os.path.join(work13, "target"); os.makedirs(target13)
 
-# Create tar with hard link (using tarinfo)
-buf = io.BytesIO()
-with tarfile.open(fileobj=buf, mode="w") as t:
-    # Regular file
-    ti = tarfile.TarInfo(name=f"{prefix}original.txt")
-    ti.size = 11
-    t.addfile(ti, io.BytesIO(b"original\n"))
-    # Hard link to it
-    ti_link = tarfile.TarInfo(name=f"{prefix}link.txt")
-    ti_link.type = tarfile.LNKTYPE  # hard link
-    ti_link.linkname = f"{prefix}original.txt"
-    t.addfile(ti_link)
-
-layer13_bytes = buf.getvalue()
+# This tests edge case: normalized path that escapes
+abs_ref_entries = [
+    (f"{prefix}WebAPI.jar", b"good", False),
+    (f"{prefix}/../etc/passwd", b"escape", False),  # tries to escape from within prefix via ../
+]
+layer13_bytes = make_tar_bytes(abs_ref_entries)
 layer13_digest = sha256_bytes(layer13_bytes)
 
 manifest13_data = {
@@ -833,6 +825,7 @@ responses13 = {
 launcher._registry_get = make_mock_registry_get(responses13)
 launcher._open_blob = make_mock_open_blob(responses13)
 
+caught = False
 try:
     result, file_count = launcher.fetch_pinned_image(
         image_name="test/image",
@@ -842,17 +835,17 @@ try:
         work=work13,
         platform_arch="amd64"
     )
-    # Original file should exist, link should not
-    if os.path.exists(os.path.join(result, "original.txt")) and not os.path.exists(os.path.join(result, "link.txt")):
-        print("  PASS: hard link was skipped")
-    elif os.path.isfile(os.path.join(result, "link.txt")) and os.path.samefile(
-        os.path.join(result, "original.txt"), os.path.join(result, "link.txt")):
-        print("  FAIL: hard link was extracted (not skipped)")
-        sys.exit(1)
-    else:
-        print("  PASS: hard link not extracted")
-except Exception as e:
-    print(f"  PASS: hard link handling: {e}")
+except RuntimeError as e:
+    if "escape" in str(e).lower():
+        caught = True
+
+if caught:
+    print("  PASS: prefix escape attempt caught")
+elif not os.path.exists(os.path.join(target13, "etc", "passwd")):
+    print("  PASS: prefix escape did not execute")
+else:
+    print("  FAIL: prefix escape was extracted!")
+    sys.exit(1)
 
 
 # Cleanup
