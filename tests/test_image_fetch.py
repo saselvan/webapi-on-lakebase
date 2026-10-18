@@ -284,7 +284,7 @@ target3 = os.path.join(work3, "target"); os.makedirs(target3)
 
 hostile_abs = [
     (f"{prefix}WebAPI.jar", b"good file", False),
-    ("/etc/shadow", b"escape!", False),  # HOSTILE: absolute path
+    (TMP + "/t3-abs-escape.txt", b"escape!", False),  # HOSTILE: absolute path (inside TMP, never a system file)
 ]
 layer3_bytes = make_tar_bytes(hostile_abs)
 layer3_digest = sha256_bytes(layer3_bytes)
@@ -323,13 +323,13 @@ try:
         work=work3,
         platform_arch="amd64"
     )
-    if not os.path.exists("/etc/shadow"):
+    if not os.path.exists(TMP + "/t3-abs-escape.txt"):
         print("  PASS: absolute paths in tar entries are refused")
     else:
-        print("  FAIL: absolute path was written to /etc/shadow!")
+        print("  FAIL: absolute path was written outside the target!")
         sys.exit(1)
 except Exception as e:
-    if "shadow" in str(e) or "absolute" in str(e).lower() or "/" in str(e):
+    if "t3-abs" in str(e) or "absolute" in str(e).lower() or "/" in str(e):
         print(f"  PASS: absolute path caught")
     else:
         print(f"  FAIL: unexpected error: {e}")
