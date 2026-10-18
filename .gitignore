@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+config.env
+queries.json
+app.yaml
+pgbouncer-*-static
+.DS_Store

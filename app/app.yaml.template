@@ -1,0 +1,38 @@
+# WebAPI app: the app's service principal through PgBouncer 1.26.1 + refresher in the app (APP_DB=pgbouncer).
+# tools/render.py renders it into the staging folder (outside the repo); the Lakebase host never enters the repo.
+# No native-login password and no Lakebase JDBC URL: WebAPI reaches Lakebase only through 127.0.0.1:6432.
+# Secrets: app resources pgb-local-password (WebAPI -> PgBouncer only) and webapi-jasypt-key
+# (tools/setup_and_deploy.sh attaches them from SECRET_SCOPE).
+# DATABRICKS_CLIENT_ID / _SECRET / _HOST are injected by Databricks Apps (the app's service principal).
+command: ["python", "launcher.py"]
+env:
+  - {name: APP_DB, value: pgbouncer}
+  - {name: LAKEBASE_HOST, value: "__LAKEBASE_HOST__"}
+  - {name: LAKEBASE_ENDPOINT, value: "__LAKEBASE_ENDPOINT__"}
+  - {name: PGB_LOCAL_PASSWORD, valueFrom: pgb-local-password}
+  - {name: PGB_REFRESH_S, value: "900"}
+  - {name: PGB_SHA256, value: "__PGB_SHA256__"}
+  - {name: JASYPT_ENCRYPTOR_PASSWORD, valueFrom: webapi-jasypt-key}
+  - {name: SOURCE_KEY, value: "__SOURCE_KEY__"}
+  - {name: TICK_CONCEPT_ID, value: "__TICK_CONCEPT_ID__"}
+  - {name: DATASOURCE_DRIVERCLASSNAME, value: org.postgresql.Driver}
+  - {name: DATASOURCE_USERNAME, value: webapi}
+  - {name: DATASOURCE_OHDSI_SCHEMA, value: __WEBAPI_SCHEMA__}
+  - {name: SPRING_JPA_PROPERTIES_HIBERNATE_DIALECT, value: org.hibernate.dialect.PostgreSQLDialect}
+  - {name: SPRING_JPA_PROPERTIES_HIBERNATE_DEFAULT_SCHEMA, value: __WEBAPI_SCHEMA__}
+  - {name: SPRING_BATCH_REPOSITORY_TABLEPREFIX, value: __WEBAPI_SCHEMA__.BATCH_}
+  - {name: FLYWAY_DATASOURCE_DRIVERCLASSNAME, value: org.postgresql.Driver}
+  - {name: FLYWAY_DATASOURCE_USERNAME, value: webapi}
+  - {name: FLYWAY_LOCATIONS, value: "classpath:db/migration/postgresql"}
+  - {name: FLYWAY_PLACEHOLDERS_OHDSISCHEMA, value: __WEBAPI_SCHEMA__}
+  - {name: FLYWAY_SCHEMAS, value: __WEBAPI_SCHEMA__}
+  - {name: FLYWAY_BASELINE_ON_MIGRATE, value: "true"}
+  - {name: FLYWAY_TABLE, value: schema_history}
+  - {name: flyway_baselineVersionAsString, value: "2.2.5.20180212152023"}
+  - {name: FLYWAY_BASELINEDESCRIPTION, value: Base Migration}
+  - {name: SECURITY_PROVIDER, value: DisabledSecurity}
+  - {name: SOLR_ENDPOINT, value: ""}
+  - {name: JASYPT_ENCRYPTOR_ENABLED, value: "true"}
+  - {name: JASYPT_ENCRYPTOR_ALGORITHM, value: "PBEWITHSHA256AND128BITAES-CBC-BC"}
+  - {name: LOGGING_LEVEL_ROOT, value: info}
+  - {name: LOGGING_LEVEL_ORG_OHDSI, value: info}

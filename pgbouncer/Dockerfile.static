@@ -1,0 +1,21 @@
+# PgBouncer 1.26.1 as ONE static linux/amd64 binary, for the Databricks App (no root, no package manager).
+# The tarball is checked against its published SHA-256. musl + static libevent and OpenSSL, so the binary needs no shared library
+# from the app's Linux. DNS goes through libevent's resolver (no c-ares).
+# Build: docker buildx build --platform linux/amd64 -f pgbouncer/Dockerfile.static --output type=local,dest=<dir> pgbouncer
+FROM --platform=linux/amd64 alpine:3.20 AS build
+ARG PGB_VERSION=1.26.1
+ARG PGB_SHA256=00886a2994b4844cd37110970df777772cfc42a74c400522c82fba509a3f42d9
+RUN apk add --no-cache build-base pkgconf libevent-dev libevent-static openssl-dev openssl-libs-static curl file
+RUN curl -fsSL -o /tmp/pgb.tgz https://www.pgbouncer.org/downloads/files/${PGB_VERSION}/pgbouncer-${PGB_VERSION}.tar.gz \
+ && echo "${PGB_SHA256}  /tmp/pgb.tgz" | sha256sum -c - \
+ && tar -xzf /tmp/pgb.tgz -C /tmp \
+ && cd /tmp/pgbouncer-${PGB_VERSION} \
+ && LDFLAGS="-static" ./configure --without-cares --without-systemd \
+ && make -j"$(nproc)" pgbouncer \
+ && strip pgbouncer \
+ && file pgbouncer | grep -q "statically linked" \
+ && ./pgbouncer --version \
+ && install -D -m 0755 pgbouncer /out/pgbouncer-1.26.1-linux-amd64-static
+
+FROM scratch
+COPY --from=build /out/ /
