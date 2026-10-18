@@ -163,7 +163,7 @@ target2 = os.path.join(work2, "target"); os.makedirs(target2)
 
 hostile_entries = [
     (f"{prefix}WebAPI.jar", b"good file", False),
-    ("var/lib/ohdsi/../../../etc/passwd", b"escape!", False),  # HOSTILE: tries to escape
+    (f"{prefix}../../etc/passwd", b"escape!", False),  # HOSTILE: tries to escape with ../
 ]
 layer2_bytes = make_tar_bytes(hostile_entries)
 layer2_digest = sha256_bytes(layer2_bytes)

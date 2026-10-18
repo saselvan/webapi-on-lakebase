@@ -195,15 +195,23 @@ def _apply_layer(blob_path, root, prefix=WEBAPI_PREFIX):
                 continue
             rel = normalized[len(prefix):]
 
-            # Reject entries with ../ or absolute paths
-            if ".." in rel or rel.startswith("/"):
+            # Reject entries with absolute paths, ../, or null bytes (path traversal attempts)
+            if rel.startswith("/") or "\x00" in rel:
+                raise RuntimeError(f"tar entry escapes prefix: {m.name}")
+
+            # Check for ../ using os.path.normpath to catch all forms of traversal
+            normalized_rel = os.path.normpath(rel)
+            if normalized_rel.startswith(".."):
                 raise RuntimeError(f"tar entry escapes prefix: {m.name}")
 
             base = os.path.basename(rel)
             if base.startswith(".wh."):
                 # Whiteout: must be for a file within the prefix
                 whiteout_target_rel = rel[:-len(base)] + base[4:]  # remove .wh. prefix
-                if ".." in whiteout_target_rel or whiteout_target_rel.startswith("/"):
+                if whiteout_target_rel.startswith("/") or "\x00" in whiteout_target_rel:
+                    raise RuntimeError(f"whiteout escapes prefix: {m.name}")
+                normalized_whiteout = os.path.normpath(whiteout_target_rel)
+                if normalized_whiteout.startswith(".."):
                     raise RuntimeError(f"whiteout escapes prefix: {m.name}")
                 target = os.path.join(root, whiteout_target_rel)
                 shutil.rmtree(target, ignore_errors=True) if os.path.isdir(target) else (os.path.exists(target) and os.remove(target))
