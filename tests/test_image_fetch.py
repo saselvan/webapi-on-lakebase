@@ -139,7 +139,7 @@ launcher._registry_get = make_mock_registry_get(responses1)
 launcher._open_blob = make_mock_open_blob(responses1)
 
 try:
-    result = launcher.fetch_webapi_pinned(
+    result, file_count = launcher.fetch_pinned_image(
         image_name="test/image",
         index_digest=index_digest,
         path_prefix=prefix,
@@ -195,7 +195,7 @@ launcher._open_blob = make_mock_open_blob(responses2)
 
 caught = False
 try:
-    result = launcher.fetch_webapi_pinned(
+    result, file_count = launcher.fetch_pinned_image(
         image_name="test/image",
         index_digest=index2_digest,
         path_prefix=prefix,
@@ -256,7 +256,7 @@ launcher._registry_get = make_mock_registry_get(responses3)
 launcher._open_blob = make_mock_open_blob(responses3)
 
 try:
-    result = launcher.fetch_webapi_pinned(
+    result, file_count = launcher.fetch_pinned_image(
         image_name="test/image",
         index_digest=index3_digest,
         path_prefix=prefix,
@@ -312,7 +312,7 @@ launcher._registry_get = make_mock_registry_get(responses4)
 launcher._open_blob = make_mock_open_blob(responses4)
 
 try:
-    result = launcher.fetch_webapi_pinned(
+    result, file_count = launcher.fetch_pinned_image(
         image_name="test/image",
         index_digest=index4_digest,
         path_prefix=prefix,
@@ -364,7 +364,7 @@ launcher._registry_get = make_mock_registry_get(responses5)
 launcher._open_blob = make_mock_open_blob(responses5)
 
 try:
-    result = launcher.fetch_webapi_pinned(
+    result, file_count = launcher.fetch_pinned_image(
         image_name="test/image",
         index_digest=index5_digest,
         path_prefix=prefix,
@@ -419,7 +419,7 @@ launcher._registry_get = make_mock_registry_get(responses6)
 launcher._open_blob = make_mock_open_blob(responses6)
 
 try:
-    result = launcher.fetch_webapi_pinned(
+    result, file_count = launcher.fetch_pinned_image(
         image_name="test/image",
         index_digest=index6_digest,
         path_prefix=prefix,

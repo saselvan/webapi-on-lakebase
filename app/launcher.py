@@ -134,7 +134,7 @@ def platform_manifest(token, image_repo=IMAGE_REPO, index_digest=IMAGE_INDEX, pl
     return json.loads(manifest)
 
 
-def fetch_webapi_pinned(image_name, index_digest, path_prefix, target_folder, work, platform_arch=None):
+def fetch_pinned_image(image_name, index_digest, path_prefix, target_folder, work, platform_arch=None):
     """Download files from a pinned Docker image by digest; validate supply chain at each step.
 
     Args:
@@ -175,11 +175,8 @@ def fetch_webapi_pinned(image_name, index_digest, path_prefix, target_folder, wo
         _apply_layer(blob, target_folder, path_prefix)
         os.remove(blob)
 
-    if not os.path.isfile(os.path.join(target_folder, "WebAPI.jar")) and not os.path.isdir(os.path.join(target_folder, "WEB-INF")):
-        raise RuntimeError("WebAPI directory not found in the image layers")
-
-    log("webapi", layers=len(manifest["layers"]), files=sum(len(f) for _, _, f in os.walk(target_folder)))
-    return target_folder
+    file_count = sum(len(f) for _, _, f in os.walk(target_folder))
+    return target_folder, file_count
 
 
 def _apply_layer(blob_path, root, prefix=WEBAPI_PREFIX):
@@ -237,10 +234,18 @@ def _apply_layer(blob_path, root, prefix=WEBAPI_PREFIX):
 def fetch_webapi(work):
     """Download WebAPI's directory from the pinned image; return its path.
 
-    Uses the new validated fetch_webapi_pinned with today's pinned values.
+    Uses the generic fetch_pinned_image with today's pinned values, then verifies WebAPI files.
     """
     root = os.path.join(work, "webapi")
-    return fetch_webapi_pinned(IMAGE_REPO, IMAGE_INDEX, WEBAPI_PREFIX, root, work)
+    target, file_count = fetch_pinned_image(IMAGE_REPO, IMAGE_INDEX, WEBAPI_PREFIX, root, work)
+    
+    # WebAPI-specific validation
+    if not os.path.isfile(os.path.join(target, "WebAPI.jar")) and not os.path.isdir(os.path.join(target, "WEB-INF")):
+        raise RuntimeError("WebAPI directory not found in the image layers")
+    
+    # Log uses file_count returned from fetch_pinned_image; layer count would require another fetch
+    log("webapi", files=file_count)
+    return target
 
 
 def java_cmd(java, root):
