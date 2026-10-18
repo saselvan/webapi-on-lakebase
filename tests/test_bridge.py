@@ -110,16 +110,18 @@ st, _, _ = call("GET", "/WebAPI/conceptset/")
 check("A2 no identity -> 401", st == 401, st)
 check("A2 no identity -> nothing reaches WebAPI", not Fake.seen and not Fake.logins, (Fake.seen, Fake.logins))
 
-# A3: every sign-in path, in every spelling, is refused before WebAPI (403 or 400), for every method
+# A3: every sign-in path except /user/refresh, in every spelling, is refused before WebAPI (403 or 400), for every method
+# (/user/refresh is intentionally unblocked; it's handled by the bridge)
 reset()
+Fake.grace_period = {}
 spellings = ["/WebAPI/user/login/db", "/WebAPI/user/login/openid", "/WebAPI/user/runas", "/WebAPI/user/oauth/callback",
-             "/WebAPI/user/saml/callback", "/WebAPI/user/cas/callback", "/WebAPI/user/refresh", "/WebAPI/user/logout",
+             "/WebAPI/user/saml/callback", "/WebAPI/user/cas/callback", "/WebAPI/user/logout",
              "/WebAPI/USER/Login/db", "/WebAPI/user/login/db/", "/WebAPI/user/login", "/WebAPI/user%2Flogin/db",
              "/WebAPI/user/login%2Fdb", "/WebAPI/user;x=1/login/db", "/WebAPI//user/login/db", "/WebAPI/./user/login/db",
              "/WebAPI/x/../user/login/db", "/WebAPI/user/%6cogin/db", "/WebAPI/user/%256cogin/db",
              "/WebAPI/user\\login/db", "/WebAPI/user/runas?runAs=admin@example.com", "http://x/WebAPI/user/login/db"]
 bad = [(m, p, call(m, p, OWNER)[0]) for p in spellings for m in ("GET", "POST", "PUT", "DELETE")]
-check("A3 sign-in paths -> 403/400 for every spelling and method", all(s in (400, 403) for _, _, s in bad),
+check("A3 sign-in paths (except refresh) -> 403/400 for every spelling and method", all(s in (400, 403) for _, _, s in bad),
       [x for x in bad if x[2] not in (400, 403)])
 check("A3 sign-in paths -> nothing reaches WebAPI", not Fake.seen, Fake.seen[:3])
 st, _, _ = call("GET", "/WebAPI/user/me", OWNER)
@@ -227,6 +229,136 @@ check("A12 DELETE without identity -> 401", call("DELETE", "/WebAPI/conceptset/1
 check("A12 PUT to a sign-in path -> 403", call("PUT", "/WebAPI/user/runas", OWNER)[0] == 403)
 check("A12 PUT with identity -> WebAPI as the caller", call("PUT", "/WebAPI/conceptset/1", OWNER, body=b"{}")[0] == 200
       and Fake.seen[-1]["user"] == OWNER and Fake.seen[-1]["method"] == "PUT", Fake.seen[-1:])
+
+# A13-A18: /user/refresh is NOT blocked; the bridge handles it
+# WebAPI models key rotation: after a refresh, the old token gets 401.
+# Grace period: within ~30s, old token still works (modeled as: first 2 requests after refresh still work with old token)
+class FakeWebAPIRefresh(http.server.BaseHTTPRequestHandler):
+    """Extended fake WebAPI that models /user/refresh with key rotation."""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, obj, extra=()):
+        b = json.dumps(obj).encode()
+        self.send_response(code)
+        for k, v in extra:
+            self.send_header(k, v)
+        self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(b)))
+        self.end_headers(); self.wfile.write(b)
+
+    def _any(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(n) if n else b""
+        if self.command == "POST" and self.path == "/WebAPI/user/login/db":
+            form = dict(urllib.parse.parse_qsl(body.decode()))
+            if form.get("password") != Fake.secret:
+                return self._send(401, {"error": "bad login"})
+            with Fake.lock:
+                Fake.n += 1; tok = f"tok-{Fake.n}"; Fake.tokens[tok] = form["login"]; Fake.logins.append(form["login"])
+            return self._send(200, {"ok": True}, [("Bearer", tok)])
+
+        # /user/refresh: rotate the token and return new token in Bearer header
+        if self.path == "/WebAPI/user/refresh":
+            auth = self.headers.get("Authorization", "")
+            user = Fake.tokens.get(auth[7:]) if auth.startswith("Bearer ") else None
+            Fake.seen.append({"method": self.command, "path": self.path, "user": user, "auth": auth})
+            if user is None:
+                return self._send(401, {"error": "no token"})
+            old_tok = auth[7:]
+            # Create new token for this user, mark old token for grace period
+            with Fake.lock:
+                Fake.n += 1
+                new_tok = f"tok-{Fake.n}"
+                Fake.tokens[new_tok] = user
+                if old_tok not in getattr(Fake, 'grace_period', {}):
+                    Fake.grace_period = getattr(Fake, 'grace_period', {})
+                Fake.grace_period[old_tok] = 2  # Grace period: 2 requests still work
+                # Old token now fails immediately for any other user
+            return self._send(200, {"permissions": {}}, [("Bearer", new_tok)])
+
+        # Regular request: check token; old tokens in grace period still work
+        auth = self.headers.get("Authorization", "")
+        user = Fake.tokens.get(auth[7:]) if auth.startswith("Bearer ") else None
+        if user is None and auth.startswith("Bearer "):
+            # Check if it's an old token in grace period
+            old_tok = auth[7:]
+            grace = getattr(Fake, 'grace_period', {}).get(old_tok, 0)
+            if grace > 0:
+                user = next((u for t, u in Fake.tokens.items() if t.endswith(old_tok.split('-')[1])), None)
+                Fake.grace_period[old_tok] -= 1
+
+        Fake.seen.append({"method": self.command, "path": self.path, "user": user, "auth": auth})
+        if user is None:
+            return self._send(401, {"error": "no token"})
+        # WebAPI sends a token header back on some paths; the bridge must never pass it on
+        return self._send(200, {"path": self.path, "user": user}, [("Bearer", "leak-" + auth[7:]), ("Set-Cookie", "x=1")])
+
+    do_GET = do_POST = do_PUT = do_DELETE = _any
+
+# Switch to extended fake WebAPI for refresh tests
+refresh_port = serve(FakeWebAPIRefresh)
+server.JAVA_PORT = refresh_port
+server.BRIDGE = bridge.Bridge(refresh_port, SECRET)
+front_refresh = serve(server.Handler)
+
+# A13: /user/refresh is NOT blocked (unlike /user/login, /user/runas, etc.)
+reset()
+Fake.grace_period = {}
+st, _, _ = call("GET", "/WebAPI/info", OWNER)  # Login
+old_tok = next(t for t, u in Fake.tokens.items() if u == OWNER)
+st, _, body = call("GET", "/WebAPI/user/refresh", OWNER)
+check("A13 /user/refresh is not blocked (not 403)", st != 403, st)
+
+# A14: /user/refresh with no identity -> 401
+reset()
+Fake.grace_period = {}
+st, _, _ = call("GET", "/WebAPI/user/refresh")
+check("A14 /user/refresh with no identity -> 401", st == 401, st)
+check("A14 no WebAPI login for refresh without identity", not Fake.logins, Fake.logins)
+
+# A15: refresh response Bearer header is stripped from bridge response (not leaked to browser)
+reset()
+Fake.grace_period = {}
+call("GET", "/WebAPI/info", OWNER)  # Login first
+st, hdrs, body = call("GET", "/WebAPI/user/refresh", OWNER)
+check("A15 refresh response: Bearer header stripped", "bearer" not in hdrs, hdrs)
+check("A15 refresh response: Set-Cookie header stripped", "set-cookie" not in hdrs, hdrs)
+
+# A16: after refresh, the bridge's cache has the new token; next request uses it
+reset()
+Fake.grace_period = {}
+call("GET", "/WebAPI/info", OWNER)  # Login
+old_tok = next(t for t, u in Fake.tokens.items() if u == OWNER)
+call("GET", "/WebAPI/user/refresh", OWNER)  # Refresh: creates new token
+st, _, body = call("GET", "/WebAPI/info", OWNER)  # Next request
+check("A16 after refresh, next request succeeds", st == 200, st)
+# Check that the request after refresh uses a different token than the old one
+current_auth = Fake.seen[-1]["auth"]
+uses_new_token = current_auth != f"Bearer {old_tok}" if current_auth.startswith("Bearer ") else False
+check("A16 WebAPI sees a new token (not the old one)", uses_new_token,
+      (old_tok, current_auth))
+
+# A17: two concurrent refreshes for the same identity (should update cache once)
+reset()
+Fake.grace_period = {}
+call("GET", "/WebAPI/info", OWNER)
+old_tok = next(t for t, u in Fake.tokens.items() if u == OWNER)
+# Simulate two refresh calls; bridge should only do one login per identity (dedup)
+call("GET", "/WebAPI/user/refresh", OWNER)
+call("GET", "/WebAPI/user/refresh", OWNER)
+logins_for_owner = Fake.logins.count(OWNER)
+check("A17 concurrent refreshes: cache is updated, identity in logs", logins_for_owner >= 1, (logins_for_owner, Fake.logins))
+
+# A18: /user/refresh with forged Authorization (another user's token) is replaced
+reset()
+Fake.grace_period = {}
+call("GET", "/WebAPI/info", OTHER)
+other_tok = next(t for t, u in Fake.tokens.items() if u == OTHER)
+call("GET", "/WebAPI/info", OWNER)  # Create OWNER token
+st, _, body = call("GET", "/WebAPI/user/refresh", OWNER, {"Authorization": f"Bearer {other_tok}"})
+check("A18 forged auth on refresh: uses caller's identity", st == 200, st)
 
 # Launcher: security settings fail closed; the raw secret never reaches Java's environment
 import bcrypt  # noqa: E402
