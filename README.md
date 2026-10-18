@@ -285,6 +285,21 @@ ATLAS, in the same app, deployed with `tools/deploy.sh` (it printed that the upl
 - 0 tokens, 0 copies of the local password and 0 bcrypt hashes in the saved results and in the app log (202 lines).
 - Offline: 5 test files pass, and 94 of 94 deliberate code breaks each made a check fail.
 
+A CDM in Delta, in the same app (the CMS DE-SynPUF 100k extract, 100,000 synthetic persons; one SQL warehouse; security on):
+
+- The launcher logged the JDBC jar with its pinned SHA-256. `source-add-cdm` answered 200. Through the proxy and the
+  bridge, the CDM source gave its vocabulary version, and concept 201826 was `Type 2 diabetes mellitus`.
+- WebAPI's stored source: no token in the URL, username and password both encrypted (`ENC(...)`).
+- The same requests on the Lakebase source and the CDM source (concept, related, `ancestorAndDescendant` for 11
+  concepts; 5 searches): 38 of 38 had the same content, in any order. On the first run, one `related` request on the
+  CDM source answered 500: the JDBC driver's socket timeout while it waited for the warehouse. The same request
+  right after answered 200. The second run, from the start, had 0 errors. The cause was not found.
+- A cohort (type 2 diabetes, first condition per person) generated on the CDM source through the app: COMPLETE in
+  52 s, 67,365 persons, equal to an independent SQL count and to the rows in the results `cohort` table.
+- A second identity got 403 on the CDM source until it was in `Source user (<CDM_SOURCE_KEY>)`, then 200. An
+  admin sees the password field masked.
+- 0 copies of the token in 163 saved files and in the app log.
+
 ## What was not tested
 
 - ATLAS with more than one user at the same time, and ATLAS features that need a results schema (record counts,
@@ -293,7 +308,7 @@ ATLAS, in the same app, deployed with `tools/deploy.sh` (it printed that the upl
 - Changing the bridge secret while users are signed in.
 - A real close at the 3-day maximum connection life (only simulated, above).
 - Rotation of the app service principal's own credentials.
-- `source-add-cdm` and the JDBC driver in the app: offline tests only, so far.
+- Load on a CDM source, and a longer JDBC `SocketTimeout`.
 - Token rotation for a CDM source.
 - Downloads staged in a Unity Catalog volume. The launcher fetches the JRE, the WebAPI image, the ATLAS image and
   the JDBC driver from the internet.
