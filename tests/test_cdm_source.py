@@ -182,7 +182,7 @@ def exits(fn):
 
 src = adm.cdm_source(CONF, HOST, TOKEN)
 check("14 body: spark, username token, krbAuthMethod password, token only in password",
-      src["dialect"] == "spark" and src["username"] == "token" and src["krbAuthMethod"] == "password"
+      src["dialect"] == "spark" and src["username"] == "token" and src.get("krbAuthMethod") == "password"
       and src["password"] == TOKEN and TOKEN not in json.dumps({k: v for k, v in src.items() if k != "password"}), str(src))
 check("14 body: URL has AuthMech=3 and no login", src["connectionString"] ==
       f"jdbc:databricks://{HOST}:443/default;transportMode=http;ssl=1;httpPath=/sql/1.0/warehouses/0123abcd;AuthMech=3"

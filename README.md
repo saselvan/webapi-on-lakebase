@@ -140,6 +140,33 @@ and refuses a layer entry that would land outside it. Then it replaces the image
 If the ATLAS download fails, WebAPI still starts, `/atlas/` answers 503 with the reason, and the launcher logs an
 `atlas_error` event in `/ops/status`.
 
+## A CDM in Delta
+
+WebAPI can also read your OMOP CDM where it already is: in Delta tables, through a Databricks SQL warehouse. Nothing
+is copied into Lakebase for this. The launcher downloads Databricks JDBC 2.6.36 from Databricks' public driver
+bucket, checks the zip and the one jar it reads by SHA-256, and puts the jar in WebAPI's `WEB-INF/lib`. A wrong file
+stops the launcher before Java starts.
+
+`tools/webapi_admin.py source-add-cdm` adds the source by REST, as an admin. The JDBC URL holds no login (`AuthMech=3`):
+a login in the URL would win over WebAPI's username and password fields, and WebAPI stores only those two encrypted.
+The username is `token`; the password is a token for the app's service principal, read from `CDM_TOKEN_FILE`. The
+source has 4 daimons (CDM, Vocabulary, Results, Temp). Its Vocabulary priority is 0, so `SOURCE_KEY` on Lakebase stays
+the default vocabulary.
+
+Before the call (as a workspace admin):
+
+1. Give the app's service principal, in Unity Catalog: `USE CATALOG`; `USE SCHEMA` and `SELECT` on the CDM and
+   vocabulary schemas; `USE SCHEMA`, `SELECT` and `MODIFY` on the results schema; `USE SCHEMA`, `CREATE TABLE` and
+   `MODIFY` on the scratch schema. The results schema holds the tables of WebAPI's results DDL
+   (`/WebAPI/ddl/results?dialect=spark`).
+2. Give it `CAN USE` on the SQL warehouse.
+3. Make a token for it (`databricks token-management create-obo-token <application id> --lifetime-seconds <s>`), and
+   save it to a file you own with mode 0600, outside this repo. `source-add-cdm` refuses any other file.
+4. Fill in the `CDM_*` keys of `config.env`, then run `python3 -I tools/webapi_admin.py source-add-cdm`, and add users
+   to `Source user (<CDM_SOURCE_KEY>)`.
+
+The token ends at its lifetime. Then make a new one and change the source's password in WebAPI.
+
 ## How the code is laid out
 
 ```text
@@ -266,7 +293,10 @@ ATLAS, in the same app, deployed with `tools/deploy.sh` (it printed that the upl
 - Changing the bridge secret while users are signed in.
 - A real close at the 3-day maximum connection life (only simulated, above).
 - Rotation of the app service principal's own credentials.
-- Downloads staged in a Unity Catalog volume. The launcher fetches the JRE, the WebAPI image and the ATLAS image from the internet.
+- `source-add-cdm` and the JDBC driver in the app: offline tests only, so far.
+- Token rotation for a CDM source.
+- Downloads staged in a Unity Catalog volume. The launcher fetches the JRE, the WebAPI image, the ATLAS image and
+  the JDBC driver from the internet.
 
 ## Why PgBouncer 1.26.1 or later
 
@@ -352,11 +382,13 @@ flowchart LR
 bash tools/check.sh
 ```
 
-It runs the 5 test files in `tests/` with pinned test packages (through `uv`), and checks the shell scripts. CI runs it
+It runs the 6 test files in `tests/` with pinned test packages (through `uv`), and checks the shell scripts. CI runs it
 on each push. All tests run offline, with no Databricks, Lakebase or Java. `tests/test_bridge.py` runs the real front server and
 bridge against a fake WebAPI, with checks for each item of the security list above. `tests/test_atlas.py` runs the
 front server on a fake ATLAS tree with hostile files (a config that turns sign-in off, symlinks out of the tree), and
 `tests/test_image_fetch.py` feeds the image download hostile layers (`..`, absolute paths, whiteouts, wrong digests).
+`tests/test_cdm_source.py` feeds the driver fetch tampered zips and symlinks, and `source-add-cdm` logins smuggled
+into the URL and token files that others can read.
 
 ## Teardown
 
