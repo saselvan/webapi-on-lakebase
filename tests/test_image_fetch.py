@@ -907,6 +907,46 @@ else:
     sys.exit(1)
 
 
+# Tests 14-17: _apply_layer on one hostile layer each. Tests 2, 3, 9 and 10 also pass when nothing is refused, so
+# these require the refusal itself (a RuntimeError) and look for the escaped file where it would land.
+def apply_one(n, entries, pfx="var/lib/ohdsi/webapi/"):
+    """Returns (refused, case folder, root). The root is inside the case folder, so an escape lands next to it."""
+    case = os.path.join(TMP, f"t{n}"); root = os.path.join(case, "root"); os.makedirs(root)
+    with open(os.path.join(case, "sentinel"), "w") as f:
+        f.write("keep")
+    blob = os.path.join(case, "layer.tar")
+    with open(blob, "wb") as f:
+        f.write(make_tar_bytes(entries))
+    try:
+        launcher._apply_layer(blob, root, pfx)
+        return False, case, root
+    except RuntimeError:
+        return True, case, root
+
+
+def need(name, ok):
+    print(f"  {'PASS' if ok else 'FAIL'}: {name}")
+    if not ok:
+        sys.exit(1)
+
+
+print("Test 14: a ../ entry is refused and nothing lands outside the root")
+ref, case, root = apply_one(14, [("var/lib/ohdsi/webapi/../escape.txt", b"x", False)])  # HOSTILE
+need("../ entry refused", ref and not os.path.exists(os.path.join(case, "escape.txt")))
+print("Test 15: an absolute entry is refused and nothing lands at that path")
+target15 = os.path.join(TMP, "t15-abs.txt")
+ref, case, root = apply_one(15, [("var/lib/ohdsi/webapi/" + target15, b"x", False)])  # HOSTILE: rel starts with /
+need("absolute entry refused", ref and not os.path.exists(target15))
+print("Test 16: a whiteout named .wh... (it names the folder above the root) is refused, and that folder stays")
+ref, case, root = apply_one(16, [("var/lib/ohdsi/webapi/.wh...", b"", False)])  # HOSTILE: would delete the parent
+need(".wh... refused, parent folder kept", ref and os.path.exists(os.path.join(case, "sentinel")))
+print("Test 17: a sibling folder with the same name length as the prefix is not written")
+ref, case, root = apply_one(17, [("var/lib/ohdsi/OTHERS/secret.txt", b"x", False),  # HOSTILE: same length as prefix
+                                  ("var/lib/ohdsi/webapi/WebAPI.jar", b"jar", False)])
+need("only prefix files written", not ref and not os.path.exists(os.path.join(root, "secret.txt"))
+     and os.path.isfile(os.path.join(root, "WebAPI.jar")))
+
+
 # Cleanup
 shutil.rmtree(TMP, ignore_errors=True)
 print("PASS: tests/test_image_fetch.py")

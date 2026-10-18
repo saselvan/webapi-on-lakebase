@@ -265,7 +265,7 @@ class FakeWebAPIRefresh(http.server.BaseHTTPRequestHandler):
             auth = self.headers.get("Authorization", "")
             user = Fake.tokens.get(auth[7:]) if auth.startswith("Bearer ") else None
             Fake.seen.append({"method": self.command, "path": self.path, "user": user, "auth": auth})
-            if user is None:
+            if user is None or getattr(Fake, "refresh_401", False):  # refresh_401: WebAPI refuses every refresh
                 return self._send(401, {"error": "no token"})
             old_tok = auth[7:]
             # Create new token for this user, mark old token for grace period
@@ -485,6 +485,22 @@ st, _, body = call("GET", "/WebAPI/user/refresh", OWNER)
 check("A33 refresh without prior login: succeeds (logs in first)", st == 200, st)
 logins_for_new = Fake.logins.count(OWNER)
 check("A33 refresh without prior login: causes one login", logins_for_new == 1, (logins_for_new, Fake.logins))
+
+# A34: WebAPI refuses every refresh -> one fresh login, one more refresh, then the 401 goes back; never a third login
+reset()
+Fake.grace_period = {}
+call("GET", "/WebAPI/info", OWNER)
+Fake.refresh_401 = True
+st, _, _ = call("GET", "/WebAPI/user/refresh", OWNER)
+Fake.refresh_401 = False
+check("A34 refresh always 401 -> 401 back, exactly one re-login", st == 401 and Fake.logins.count(OWNER) == 2, (st, Fake.logins))
+
+# A35: the bridge's status counts refreshes, one per successful refresh
+reset()
+Fake.grace_period = {}
+n0 = server.BRIDGE.status()["refreshes"]
+call("GET", "/WebAPI/user/refresh", OWNER)
+check("A35 status counts one refresh", server.BRIDGE.status()["refreshes"] == n0 + 1, server.BRIDGE.status())
 
 # Launcher: security settings fail closed; the raw secret never reaches Java's environment
 import bcrypt  # noqa: E402
