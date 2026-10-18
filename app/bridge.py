@@ -8,7 +8,9 @@ values and strips Authorization (checked live). The bridge maps that identity to
             code that holds the secret can log in. WebAPI's own roles and per-source rights decide what a login sees.
   token     read from the 'Bearer' response header, cached per identity, sent as Authorization on every forwarded
             request (a client Authorization is always replaced); one fresh login after a 401
-  blocked   WebAPI's own login, run-as, OAuth, SAML, CAS, refresh and logout paths: 403 from outside
+  blocked   WebAPI's own login, run-as, OAuth, SAML, CAS, and logout paths: 403 from outside
+  refresh   GET /WebAPI/user/refresh as the identity; the new token from the Bearer header is cached,
+            the header and body are stripped from the bridge's response so the token never leaves this process
   refused   a path that is ambiguous after one percent-decode (';', '\\', '%', '//', '.' or '..' segments): 400
 Internal callers (ticker, load runner) use INTERNAL_ID, which no proxy identity can match (it holds ':').
 The secret and the tokens stay in this process: never in a log line, a response body or a response header.
@@ -18,7 +20,8 @@ import http.client, re, threading, urllib.parse
 INTERNAL_ID = "svc:monitor"
 LOGIN_PATH = "/WebAPI/user/login/db"
 BLOCKED = ("/webapi/user/login", "/webapi/user/runas", "/webapi/user/oauth", "/webapi/user/saml",
-           "/webapi/user/cas", "/webapi/user/refresh", "/webapi/user/logout")
+           "/webapi/user/cas", "/webapi/user/logout")
+REFRESH_PATH = "/webapi/user/refresh"
 _EMAIL = re.compile(r"[a-z0-9][a-z0-9._+-]{0,63}@[a-z0-9][a-z0-9-]*(\.[a-z0-9-]+)+")
 _UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _HASH = re.compile(r"\$2a\$\d\d\$[./0-9A-Za-z]{53}")
@@ -69,7 +72,7 @@ class Bridge:
             raise ValueError("bridge secret missing or shorter than 32 characters")
         self.java_port, self._secret, self.timeout = java_port, secret, timeout
         self._tokens, self._locks, self._lock = {}, {}, threading.Lock()
-        self.stats = {"logins": 0, "login_failures": 0, "relogins": 0, "last_failure": None}
+        self.stats = {"logins": 0, "login_failures": 0, "relogins": 0, "refreshes": 0, "last_failure": None}
 
     def _conn(self):
         return http.client.HTTPConnection("127.0.0.1", self.java_port, timeout=self.timeout)
@@ -103,8 +106,45 @@ class Bridge:
             if self._tokens.get(ident) == tok:
                 del self._tokens[ident]
 
+    def _refresh(self, ident):
+        """Refresh the token for ident by calling /user/refresh, cache the new token, return (status, hdrs, body).
+
+        WebAPI's /user/refresh returns the user's permissions JSON in the body (only a Bearer header has the token).
+        If WebAPI answers 401 (cached token expired or key rotated away), drop the token, do one fresh login,
+        then try refresh once more. Never retry after a second 401.
+        """
+        tok = self.token(ident)  # Get current token; blocks on concurrent refresh for same identity
+        for attempt in (0, 1):
+            out = {"Authorization": f"Bearer {tok}"}
+            c = self._conn()
+            try:
+                c.request("GET", "/WebAPI/user/refresh", b"", out)
+                r = c.getresponse(); data = r.read()
+                hdrs = [(k, v) for k, v in r.getheaders() if k.lower() not in STRIP_RESPONSE]
+                new_tok = r.getheader("Bearer")
+            finally:
+                c.close()
+            if r.status != 401 or attempt:  # On 401, only retry once
+                if r.status == 200 and new_tok:
+                    with self._lock:
+                        self._tokens[ident] = new_tok
+                    self.stats["refreshes"] += 1
+                return r.status, hdrs, data
+            # 401: drop cached token and get a fresh one for the retry
+            self.drop(ident, tok)
+            tok = self.token(ident, fresh=True)
+        return r.status, hdrs, data
+
     def request(self, method, target, body, headers, ident):
-        """Forward one request to WebAPI as ident. Returns (status, [(header, value)], body bytes)."""
+        """Forward one request to WebAPI as ident. Returns (status, [(header, value)], body bytes).
+
+        If target is /user/refresh, calls _refresh which updates the cache with the new token.
+        Path matching is case-insensitive and ignores trailing slashes.
+        """
+        path = normalize_path(target) or target
+        if path.lower().rstrip("/") == REFRESH_PATH:
+            return self._refresh(ident)
+
         out = {k: v for k, v in headers.items() if k.lower() != "authorization"}
         for attempt in (0, 1):
             tok = self.token(ident)
