@@ -221,6 +221,14 @@ def _apply_layer(blob_path, root, prefix=WEBAPI_PREFIX):
             if m.issym() or m.islnk() or m.isdev():
                 continue  # WebAPI's tree is plain files and directories
 
+            # Final safety check: ensure the final path is within root
+            final_path = os.path.join(root, rel)
+            # Normalize and check that it's within root (after normalization)
+            norm_final = os.path.normpath(final_path)
+            norm_root = os.path.normpath(root)
+            if not norm_final.startswith(norm_root + os.sep) and norm_final != norm_root:
+                raise RuntimeError(f"final path escapes root: {final_path}")
+
             m.name = rel
             if rel:
                 t.extract(m, root)
