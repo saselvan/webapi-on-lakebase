@@ -161,14 +161,26 @@ the operations path to `/ops`, and drops a search plug-in that is not part of th
 for adding a source: with security on, `tools/webapi_admin.py source-add` uses WebAPI's REST path, which also makes
 the source's role. The load runner's third step is `ancestorAndDescendant`, because WebAPI's per-source role has no
 right for `/descendants`. That was checked live once, for a service principal in the source's role:
-`ancestorAndDescendant` 200, `descendants` 403. This copy passes its offline tests, and `tools/webapi_admin.py`
-(`me`, `forged`, `get`) ran against the tested app. This copy as a whole has not been deployed.
+`ancestorAndDescendant` 200, `descendants` 403.
+
+This copy, deployed as committed to a new app on the same Lakebase project (autoscaling 1-8 CU), with
+`config.env` filled in and no code changed:
+
+- `render.py` and `setup_and_deploy.sh` worked as written. Flyway: 202 rows, 202 succeeded.
+- The 8 calls of step 5 below worked in that order, plus `role-add "Source user (<SOURCE_KEY>)" svc:monitor`.
+  `forged` printed the signed-in user's login twice. 8 WebAPI sign-in paths got 403 through the app.
+- Load with security on: 1, 8 and 32 users, each with a 30 s warm-up and 180 s measured, one forced token change per
+  level, click path search, concept, `ancestorAndDescendant`, all through the bridge. 2,898 samples, every response
+  HTTP 200, 0 client errors, 0 bridge login failures, 0 PgBouncer login-failed or JWT lines. Click paths per second:
+  2.26 at 8 users and 2.19 at 32 users (security off: 2.24 and 2.14). At 1 user: 0.36 (security off: 1.16),
+  because some first searches were still cold (slowest 33.2 s). Before that run, one 60 s warm-up at 1 user
+  (not measured) had 1 client timeout on the first search of a cold vocabulary.
+- 0 tokens and 0 copies of the local password in the saved results and in the app log (468 lines).
 
 ## What was not tested
 
 - The ATLAS web app in a browser. The tested requests were REST calls through the proxy and from inside the app.
-- A load test with security on. The load numbers above ran with security off, and the `ancestorAndDescendant` step
-  ran once, not under load.
+- A long run (hours) with security on, a simulated connection close with security on, and more than 32 users.
 - Changing the bridge secret while users are signed in.
 - A real close at the 3-day maximum connection life (only simulated, above).
 - Rotation of the app service principal's own credentials.
