@@ -5,7 +5,9 @@ Databricks Apps has no Java runtime and no root, so the launcher brings its own:
 2. /var/lib/ohdsi/webapi from the pinned image ohdsi/webapi@sha256:bc5cffde... (its linux/amd64 manifest),
    fetched from Docker Hub by digest; the manifest and every layer are checked by SHA-256;
 3. ATLAS 2.15.0 (/usr/share/nginx/html/atlas) from the pinned image ohdsi/atlas@sha256:6814e8c5..., checked the same
-   way, with its config-local.js replaced by ATLAS_CONFIG. If that fails, WebAPI still starts and /atlas answers 503.
+   way, with its config-local.js replaced by ATLAS_CONFIG. If that fails, WebAPI still starts and /atlas answers 503;
+4. Databricks JDBC 2.6.36 (for a CDM in Delta, read through a SQL warehouse) into WebAPI's WEB-INF/lib: the zip and the
+   one jar read from it are both checked by SHA-256. A wrong file stops the launcher.
 Then it runs WebAPI on 127.0.0.1:APP_JAVA_PORT, and server.py on DATABRICKS_APP_PORT (forwards /WebAPI, serves
 /atlas and /ops).
 
@@ -23,7 +25,7 @@ hash of the secret, builds WebAPI's DB-login query from it, points that login at
 out of Java's environment. It refuses to start on any other security setting.
 """
 import urllib.error
-import hashlib, json, os, platform, shutil, signal, subprocess, sys, tarfile, threading, time, urllib.request
+import hashlib, json, os, platform, shutil, signal, subprocess, sys, tarfile, threading, time, urllib.request, zipfile
 
 JRE = {
     "x86_64": ("OpenJDK8U-jre_x64_linux_hotspot_8u492b09.tar.gz",
@@ -39,6 +41,12 @@ WEBAPI_PREFIX = "var/lib/ohdsi/webapi/"
 ATLAS_REPO = "ohdsi/atlas"
 ATLAS_INDEX = "sha256:6814e8c5b5366b50bc197b1eb2881689e5852784742b91b9636eec514f5a555e"  # ATLAS 2.15.0
 ATLAS_PREFIX = "usr/share/nginx/html/atlas/"
+JDBC_ZIP = ("https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/jdbc/2.6.36/"
+            "DatabricksJDBC42-2.6.36.1062.zip")
+JDBC_ZIP_SHA = "886fb56d96029cfc8e21bd7520ce7888c1ca81a13d9dea58f5c852127959bab0"
+JDBC_ENTRY = "DatabricksJDBC42-2.6.36.1062/DatabricksJDBC42.jar"
+JDBC_JAR_SHA = "83ba88ba02c4765630f99ba5e2a193b511a5c8eb867b6d44941a562100e21563"
+JDBC_JAR = "DatabricksJDBC42.jar"
 ATLAS_CONFIG = """define([], function () {
   // Written by app/launcher.py at start; it replaces the image's own config-local.js.
   // WebAPI is this app's /WebAPI/. Sign-in is on: ATLAS asks /WebAPI/user/me, and the front server answers as the
@@ -292,6 +300,37 @@ def fetch_atlas(work):
     return root
 
 
+def fetch_jdbc(work, root):
+    """Databricks JDBC 2.6.36 into WebAPI's WEB-INF/lib; return the jar path. Only the one pinned entry is read from
+    the zip (no extract). A jar or symlink already at the target, or a lib folder that is a symlink, is refused."""
+    path = os.path.join(work, "databricks-jdbc.zip")
+    try:
+        urllib.request.urlretrieve(JDBC_ZIP, path)
+        got = sha256_file(path)
+        if got != JDBC_ZIP_SHA:
+            raise RuntimeError(f"JDBC zip sha256 mismatch: {got}")
+        with zipfile.ZipFile(path) as z:
+            data = z.read(JDBC_ENTRY)
+    except KeyError:
+        raise RuntimeError(f"{JDBC_ENTRY} not in the JDBC zip") from None
+    finally:
+        if os.path.lexists(path):
+            os.remove(path)
+    got = hashlib.sha256(data).hexdigest()
+    if got != JDBC_JAR_SHA:
+        raise RuntimeError(f"JDBC jar sha256 mismatch: {got}")
+    lib = os.path.join(root, "WEB-INF", "lib")
+    if os.path.islink(lib) or not os.path.isdir(lib):
+        raise RuntimeError("WEB-INF/lib is missing or a symlink")
+    dest = os.path.join(lib, JDBC_JAR)
+    if os.path.lexists(dest):
+        raise RuntimeError(f"{JDBC_JAR} is already in WEB-INF/lib")
+    with open(dest, "xb") as f:
+        f.write(data)
+    log("jdbc", sha256=got, jar=JDBC_JAR)
+    return dest
+
+
 def java_cmd(java, root):
     opts = os.environ.get("DEFAULT_JAVA_OPTS", "-Djava.security.egd=file:///dev/./urandom").split()
     opts += os.environ.get("APP_HEAP", "-Xms1g -Xmx3g").split()
@@ -360,6 +399,7 @@ def main():
     t0 = time.monotonic()
     java = fetch_jre(work)
     root = fetch_webapi(work)
+    fetch_jdbc(work, root)
     atlas = fetch_atlas(work)
     pgb = None
     if os.environ.get("APP_DB", "native") == "pgbouncer":
@@ -395,7 +435,9 @@ if __name__ == "__main__":
     if sys.argv[1:] == ["--fetch-only"]:  # laptop check: download and verify, do not start WebAPI
         w = os.environ.get("APP_WORK", "/tmp/webapi-app")
         os.makedirs(w, exist_ok=True)
-        print(fetch_webapi(w))
+        r = fetch_webapi(w)
+        print(r)
+        print(fetch_jdbc(w, r))
         print(fetch_atlas(w))
     else:
         main()
