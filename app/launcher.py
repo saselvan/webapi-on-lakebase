@@ -105,58 +105,126 @@ def _digest_bytes(data, digest):
         raise RuntimeError(f"digest mismatch: want {digest}, got {got}")
 
 
-def platform_manifest(token):
-    """Resolve the pinned index to this machine's platform manifest; both are checked by digest."""
-    base = f"https://registry-1.docker.io/v2/{IMAGE_REPO}/manifests/"
-    index = _registry_get(base + IMAGE_INDEX, token, MANIFEST_TYPES).read()
-    _digest_bytes(index, IMAGE_INDEX)
-    arch = os.environ.get("APP_ARCH") or PLATFORM_ARCH[platform.machine()]  # APP_ARCH: laptop check only
-    entry = next(m for m in json.loads(index)["manifests"]
-                 if m.get("platform", {}).get("os") == "linux" and m["platform"].get("architecture") == arch)
+def platform_manifest(token, image_repo=IMAGE_REPO, index_digest=IMAGE_INDEX, platform_arch="amd64"):
+    """Resolve a pinned index to a platform manifest; both are checked by digest.
+
+    Args:
+        token: Docker Hub auth token.
+        image_repo: image name (e.g. "ohdsi/webapi").
+        index_digest: pinned index digest (e.g. "sha256:abc123...").
+        platform_arch: target architecture (e.g. "amd64").
+
+    Returns: manifest dict.
+    Raises: RuntimeError if index/manifest digests don't match or platform not found.
+    """
+    base = f"https://registry-1.docker.io/v2/{image_repo}/manifests/"
+    index = _registry_get(base + index_digest, token, MANIFEST_TYPES).read()
+    _digest_bytes(index, index_digest)
+
+    # Find the matching platform manifest
+    entry = next((m for m in json.loads(index)["manifests"]
+                  if m.get("platform", {}).get("os") == "linux" and m.get("platform", {}).get("architecture") == platform_arch),
+                 None)
+    if not entry:
+        raise RuntimeError(f"no manifest for linux/{platform_arch} in index {index_digest}")
+
     manifest = _registry_get(base + entry["digest"], token, entry["mediaType"]).read()
     _digest_bytes(manifest, entry["digest"])
-    log("manifest", index=IMAGE_INDEX, platform=f"linux/{arch}", digest=entry["digest"])
+    log("manifest", index=index_digest, platform=f"linux/{platform_arch}", digest=entry["digest"])
     return json.loads(manifest)
 
 
-def _apply_layer(blob_path, root):
-    """Extract only WebAPI's directory from one layer; honour whiteouts from later layers."""
+def fetch_webapi_pinned(image_name, index_digest, path_prefix, target_folder, work, platform_arch=None):
+    """Download files from a pinned Docker image by digest; validate supply chain at each step.
+
+    Args:
+        image_name: Docker image name (e.g. "ohdsi/webapi").
+        index_digest: pinned index digest (e.g. "sha256:abc123...").
+        path_prefix: prefix path inside the image to extract (e.g. "var/lib/ohdsi/webapi/").
+        target_folder: local folder to extract files into.
+        work: work directory for intermediate blobs.
+        platform_arch: target architecture (default: this machine's architecture, or from APP_ARCH env).
+
+    Returns: target_folder path.
+
+    Rejects:
+        - Manifests/layers whose digest doesn't match the pinned hash.
+        - Wrong platform manifest.
+        - Tar entries with ../, absolute paths, or symlinks pointing outside the prefix.
+        - Whiteouts attempting to delete outside the prefix.
+    """
+    if platform_arch is None:
+        platform_arch = os.environ.get("APP_ARCH") or PLATFORM_ARCH[platform.machine()]
+
+    os.makedirs(target_folder, exist_ok=True)
+    tok = json.load(urllib.request.urlopen(
+        f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{image_name}:pull", timeout=60))["token"]
+
+    manifest = platform_manifest(tok, image_name, index_digest, platform_arch)
+
+    for layer in manifest["layers"]:
+        blob = os.path.join(work, "layer.blob")
+        with _open_blob(f"https://registry-1.docker.io/v2/{image_name}/blobs/{layer['digest']}", tok) as r, open(blob, "wb") as f:
+            shutil.copyfileobj(r, f, 1 << 20)
+
+        # Validate layer digest before extraction
+        got_digest = "sha256:" + sha256_file(blob)
+        if got_digest != layer["digest"]:
+            raise RuntimeError(f"layer digest mismatch: want {layer['digest']}, got {got_digest}")
+
+        _apply_layer(blob, target_folder, path_prefix)
+        os.remove(blob)
+
+    if not os.path.isfile(os.path.join(target_folder, "WebAPI.jar")) and not os.path.isdir(os.path.join(target_folder, "WEB-INF")):
+        raise RuntimeError("WebAPI directory not found in the image layers")
+
+    log("webapi", layers=len(manifest["layers"]), files=sum(len(f) for _, _, f in os.walk(target_folder)))
+    return target_folder
+
+
+def _apply_layer(blob_path, root, prefix=WEBAPI_PREFIX):
+    """Extract only files under prefix from one layer; honour whiteouts from later layers.
+
+    Rejects: tar entries with ../ or absolute paths, symlinks pointing outside prefix,
+    whiteouts attempting to modify outside prefix.
+    """
     with tarfile.open(blob_path) as t:  # gzip or plain tar, autodetected
         for m in t:
-            if not m.name.lstrip("./").startswith(WEBAPI_PREFIX):
+            normalized = m.name.lstrip("./")
+            if not normalized.startswith(prefix):
                 continue
-            rel = m.name.lstrip("./")[len(WEBAPI_PREFIX):]
+            rel = normalized[len(prefix):]
+
+            # Reject entries with ../ or absolute paths
+            if ".." in rel or rel.startswith("/"):
+                raise RuntimeError(f"tar entry escapes prefix: {m.name}")
+
             base = os.path.basename(rel)
             if base.startswith(".wh."):
-                target = os.path.join(root, os.path.dirname(rel), base[4:])
+                # Whiteout: must be for a file within the prefix
+                whiteout_target_rel = rel[:-len(base)] + base[4:]  # remove .wh. prefix
+                if ".." in whiteout_target_rel or whiteout_target_rel.startswith("/"):
+                    raise RuntimeError(f"whiteout escapes prefix: {m.name}")
+                target = os.path.join(root, whiteout_target_rel)
                 shutil.rmtree(target, ignore_errors=True) if os.path.isdir(target) else (os.path.exists(target) and os.remove(target))
                 continue
+
+            # Reject symlinks (they could point outside the prefix)
             if m.issym() or m.islnk() or m.isdev():
                 continue  # WebAPI's tree is plain files and directories
+
             m.name = rel
             if rel:
                 t.extract(m, root)
 
 
 def fetch_webapi(work):
-    """Download WebAPI's directory from the pinned image; return its path."""
-    tok = json.load(urllib.request.urlopen(
-        f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{IMAGE_REPO}:pull", timeout=60))["token"]
-    manifest = platform_manifest(tok)
+    """Download WebAPI's directory from the pinned image; return its path.
+
+    Uses the new validated fetch_webapi_pinned with today's pinned values.
+    """
     root = os.path.join(work, "webapi")
-    os.makedirs(root, exist_ok=True)
-    for layer in manifest["layers"]:
-        blob = os.path.join(work, "layer.blob")
-        with _open_blob(f"https://registry-1.docker.io/v2/{IMAGE_REPO}/blobs/{layer['digest']}", tok) as r, open(blob, "wb") as f:
-            shutil.copyfileobj(r, f, 1 << 20)
-        if "sha256:" + sha256_file(blob) != layer["digest"]:
-            raise RuntimeError(f"layer digest mismatch: {layer['digest']}")
-        _apply_layer(blob, root)
-        os.remove(blob)
-    if not os.path.isfile(os.path.join(root, "WebAPI.jar")) and not os.path.isdir(os.path.join(root, "WEB-INF")):
-        raise RuntimeError("WebAPI directory not found in the image layers")
-    log("webapi", layers=len(manifest["layers"]), files=sum(len(f) for _, _, f in os.walk(root)))
-    return root
+    return fetch_webapi_pinned(IMAGE_REPO, IMAGE_INDEX, WEBAPI_PREFIX, root, work)
 
 
 def java_cmd(java, root):
