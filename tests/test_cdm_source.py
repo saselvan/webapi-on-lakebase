@@ -1,18 +1,13 @@
-"""Offline tests of the CDM-in-Delta path: the launcher's JDBC driver fetch, and tools/webapi_admin.py source-add-cdm.
+"""Offline tests of the CDM-in-Delta path: a refused JDBC driver stops the launcher, and tools/webapi_admin.py
+source-add-cdm.
 
 **What this protects:** the Java code WebAPI loads (only the pinned Databricks JDBC jar may enter WEB-INF/lib), and the
 CDM login token (it lives only in WebAPI's encrypted password field: never in the URL, a printed line or a file in the
 repo).
 
 **Attacker list (minimum, extended):**
-1. A tampered zip (its SHA-256 differs): refused, nothing written to WEB-INF/lib, the zip removed.
-2. A zip with the pinned hash but a different jar inside: refused, nothing written.
-3. A zip without the pinned entry: refused with a RuntimeError, nothing written.
-4. A zip with a `../` entry next to the jar: nothing written outside WEB-INF/lib (the zip is never extracted).
-5. A jar, or a symlink to a file outside, already at WEB-INF/lib/DatabricksJDBC42.jar: refused, the outside file unchanged.
-6. WEB-INF/lib missing, or a symlink to a folder outside: refused, nothing written there.
+The driver fetch itself (tampered zip, other jar, `../` entries, symlinks, the pinned values) is in test_artifacts.py.
 7. A refused driver stops the launcher: main() raises before Java starts.
-8. The pinned URL, zip hash, entry and jar hash are the published values (https, databricks-bi-artifacts).
 9. A login smuggled into the URL through CDM_HTTP_PATH (`;UID=`, `;PWD=`, `;AuthMech=`): refused.
 10. A schema name with SQL or a separator (`;`, a space, a quote, no catalog): refused.
 11. The token file group- or world-readable, a symlink, or inside the repo: refused.
@@ -23,11 +18,12 @@ repo).
 
 Usage: python3 -I tests/test_cdm_source.py   (exit 0 = pass)
 """
-import contextlib, hashlib, importlib.util, io, json, os, shutil, sys, tempfile, zipfile
+import contextlib, importlib.util, io, json, os, shutil, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TMP = tempfile.mkdtemp(prefix="cdm-source-test.")
-shutil.copy(os.path.join(HERE, "..", "app", "launcher.py"), TMP)
+for f in ("launcher.py", "artifacts.py"):
+    shutil.copy(os.path.join(HERE, "..", "app", f), TMP)
 sys.path.insert(0, TMP)
 import launcher  # noqa: E402
 
@@ -51,100 +47,11 @@ def raises(fn, kind=Exception):
     return None
 
 
-# ---- launcher.fetch_jdbc ----
-PINNED = (launcher.JDBC_ZIP, launcher.JDBC_ZIP_SHA, launcher.JDBC_ENTRY, launcher.JDBC_JAR_SHA)
-check("8 pinned values", PINNED == (
-    "https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/jdbc/2.6.36/DatabricksJDBC42-2.6.36.1062.zip",
-    "886fb56d96029cfc8e21bd7520ce7888c1ca81a13d9dea58f5c852127959bab0",
-    "DatabricksJDBC42-2.6.36.1062/DatabricksJDBC42.jar",
-    "83ba88ba02c4765630f99ba5e2a193b511a5c8eb867b6d44941a562100e21563"), str(PINNED))
-
-JAR = b"PK-fake-databricks-jdbc-jar"
-
-
-def make_zip(entries):
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w") as z:
-        for name, data in entries:
-            z.writestr(name, data)
-    return buf.getvalue()
-
-
-def case(name, zip_bytes, zip_sha=None, jar_sha=None, lib="dir", dest=None):
-    """A fresh WebAPI root; returns (exception or None, root, work, outside)."""
-    base = os.path.join(TMP, name)
-    work, root, outside = (os.path.join(base, d) for d in ("work", "webapi", "outside"))
-    for d in (work, root, outside):
-        os.makedirs(d)
-    if lib == "dir":
-        os.makedirs(os.path.join(root, "WEB-INF", "lib"))
-    elif lib == "link":
-        os.makedirs(os.path.join(root, "WEB-INF"))
-        os.symlink(outside, os.path.join(root, "WEB-INF", "lib"))
-    if dest == "file":
-        open(os.path.join(root, "WEB-INF", "lib", launcher.JDBC_JAR), "wb").write(b"old")
-    elif dest == "link":
-        open(os.path.join(outside, "victim.jar"), "wb").write(b"victim")
-        os.symlink(os.path.join(outside, "victim.jar"), os.path.join(root, "WEB-INF", "lib", launcher.JDBC_JAR))
-    launcher.urllib.request.urlretrieve = lambda url, path: open(path, "wb").write(zip_bytes)
-    launcher.JDBC_ZIP_SHA = zip_sha or hashlib.sha256(zip_bytes).hexdigest()
-    launcher.JDBC_JAR_SHA = jar_sha or hashlib.sha256(JAR).hexdigest()
-    err = raises(lambda: launcher.fetch_jdbc(work, root), RuntimeError)
-    return err, root, work, outside
-
-
-def lib_files(root):
-    lib = os.path.join(root, "WEB-INF", "lib")
-    return sorted(os.listdir(lib)) if os.path.isdir(lib) and not os.path.islink(lib) else []
-
-
-def tree(path):
-    return sorted(os.path.relpath(os.path.join(d, f), path) for d, _, fs in os.walk(path) for f in fs)
-
-
-good = make_zip([(PINNED[2], JAR)])
-err, root, work, _ = case("good", good)
-dest = os.path.join(root, "WEB-INF", "lib", launcher.JDBC_JAR)
-check("good zip: jar written, zip removed", err is None and open(dest, "rb").read() == JAR and os.listdir(work) == [],
-      f"{err} {os.listdir(work)}")
-check("good zip: jdbc event logged with the jar hash", any(e.get("event") == "jdbc" and e.get("sha256") == launcher.JDBC_JAR_SHA
-                                                          for e in launcher.EVENTS), str(launcher.EVENTS[-1:]))
-
-err, root, work, _ = case("tampered_zip", good, zip_sha="0" * 64)
-check("1 tampered zip refused, nothing written, zip removed", err is not None and "zip sha256" in str(err)
-      and lib_files(root) == [] and os.listdir(work) == [], f"{err} {lib_files(root)} {os.listdir(work)}")
-
-err, root, work, _ = case("other_jar", make_zip([(PINNED[2], b"PK-other-jar")]))
-check("2 other jar refused, nothing written", err is not None and "jar sha256" in str(err) and lib_files(root) == [],
-      f"{err} {lib_files(root)}")
-
-err, root, work, _ = case("no_entry", make_zip([("other/DatabricksJDBC42.jar", JAR)]))
-check("3 missing entry refused, nothing written, zip removed", err is not None and "not in the JDBC zip" in str(err)
-      and lib_files(root) == [] and os.listdir(work) == [], f"{err!r} {lib_files(root)}")
-
-err, root, work, outside = case("traversal", make_zip([("../../outside/evil.jar", b"EVIL"), (PINNED[2], JAR)]))
-base = os.path.dirname(root)
-check("4 '../' entry: only the jar written, nothing outside", err is None and lib_files(root) == [launcher.JDBC_JAR]
-      and tree(base) == sorted([os.path.join("webapi", "WEB-INF", "lib", launcher.JDBC_JAR)]), f"{err} {tree(base)}")
-
-err, root, _, _ = case("dest_file", good, dest="file")
-check("5a jar already there refused, old file kept", err is not None and "already" in str(err)
-      and open(os.path.join(root, "WEB-INF", "lib", launcher.JDBC_JAR), "rb").read() == b"old", str(err))
-err, root, _, outside = case("dest_link", good, dest="link")
-check("5b symlink at the target refused, outside file unchanged", err is not None
-      and open(os.path.join(outside, "victim.jar"), "rb").read() == b"victim", str(err))
-
-err, root, _, _ = case("lib_missing", good, lib=None)
-check("6a WEB-INF/lib missing refused", err is not None and "WEB-INF/lib" in str(err), str(err))
-err, root, _, outside = case("lib_link", good, lib="link")
-check("6b WEB-INF/lib symlink refused, nothing outside", err is not None and os.listdir(outside) == [],
-      f"{err} {os.listdir(outside)}")
-
 # 7: a refused driver stops main() before Java starts
 STARTED = []
 os.environ["APP_WORK"] = os.path.join(TMP, "main_work")
 launcher.fetch_jre = lambda w: "/bin/false"
-launcher.fetch_webapi = lambda w: os.path.join(TMP, "good", "webapi")
+launcher.fetch_webapi = lambda w: os.path.join(TMP, "webapi")
 launcher.fetch_atlas = lambda w: None
 launcher.fetch_jdbc = lambda w, r: (_ for _ in ()).throw(RuntimeError("JDBC jar sha256 mismatch: test"))
 launcher.subprocess.Popen = lambda *a, **k: STARTED.append(a)

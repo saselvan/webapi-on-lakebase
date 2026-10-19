@@ -1,16 +1,16 @@
 """Offline test of ticket 02: ATLAS from the pinned image, served at /atlas behind the bridge's gate.
 
-No network: launcher.fetch_pinned_image is replaced by a fake that writes an ATLAS tree, then the real fetch_atlas
-and the real front server run on it. Hostile rows: the image's own config-local.js with sign-in OFF and a foreign
+No network: the real artifacts.fetch runs against a fake registry (a transport fake and a test pin, because a fake
+cannot match the real digest) that serves an ATLAS tree; the real fetch_atlas and the real front server run on it. Hostile rows: the image's own config-local.js with sign-in OFF and a foreign
 WebAPI host (it must never be served), a config-local.js that is a symlink to a file outside the tree, a symlink
 inside the tree to a secret outside it, every encoding of '..', a request with no identity, a fake WebAPI that
 counts any /atlas request it sees (none may reach it).
 Usage: python3 -I tests/test_atlas.py   (needs bcrypt: pip install -r app/requirements.txt; exit 0 = pass)
 """
-import http.client, http.server, json, os, re, shutil, socketserver, sys, tempfile, threading
+import hashlib, http.client, http.server, io, json, os, re, shutil, socketserver, sys, tarfile, tempfile, threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app"))
-import bridge, launcher, server  # noqa: E402
+import artifacts, bridge, launcher, server  # noqa: E402
 
 SECRET = "s" * 20 + "-atlas-test-secret-0123456789"  # a test value, not a real secret
 OUTSIDE = "OUTSIDE-SECRET-6f1c"  # text of a file outside the ATLAS tree: must never be in any answer
@@ -30,30 +30,77 @@ os.makedirs(WORK)
 with open(os.path.join(TMP, "secret.txt"), "w") as f:
     f.write(OUTSIDE)
 CALLS = []
+PREFIX = "usr/share/nginx/html/atlas/"
+ATLAS_FILES = {"index.html": "<html>ATLAS-INDEX</html>", "js/main.js": "var atlasMain = 1;",
+               "js/config-local.js": IMAGE_CONFIG, "css/app.css": "body{}", "images/logo.png": "PNG",
+               "images/icon.svg": "<svg/>", "fonts/a.woff2": "W2", "js/x.json": "{}"}
 
 
-def fake_fetch(image_name, index_digest, path_prefix, target_folder, work, platform_arch=None):
-    """Writes what the pinned ATLAS image holds, plus the hostile rows."""
-    CALLS.append((image_name, index_digest, path_prefix))
-    files = {"index.html": "<html>ATLAS-INDEX</html>", "js/main.js": "var atlasMain = 1;",
-             "js/config-local.js": IMAGE_CONFIG, "css/app.css": "body{}", "images/logo.png": "PNG",
-             "images/icon.svg": "<svg/>", "fonts/a.woff2": "W2", "js/x.json": "{}"}
-    for rel, text in files.items():
-        os.makedirs(os.path.join(target_folder, os.path.dirname(rel)), exist_ok=True)
-        with open(os.path.join(target_folder, rel), "w") as f:
-            f.write(text)
-    os.symlink(os.path.join(TMP, "secret.txt"), os.path.join(target_folder, "images", "leak.png"))  # hostile
-    return target_folder, len(files)
+class Resp:
+    def __init__(self, status, body=b"", location=None):
+        self.status, self.location, self._b = status, location, io.BytesIO(body)
+
+    def read(self, n=-1):
+        return self._b.read(n)
+
+    def close(self):
+        pass
+
+
+def registry(files, tamper=False):
+    """A fake Docker Hub holding one image: files under PREFIX, plus a symlink to the outside secret (hostile).
+    Returns (transport, pin)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as t:
+        for rel, text in files.items():
+            ti = tarfile.TarInfo(PREFIX + rel)
+            ti.size = len(text.encode())
+            t.addfile(ti, io.BytesIO(text.encode()))
+        ti = tarfile.TarInfo(PREFIX + "images/leak.png")
+        ti.type, ti.linkname = tarfile.SYMTYPE, os.path.join(TMP, "secret.txt")
+        t.addfile(ti)
+    layer = buf.getvalue()
+    ld = "sha256:" + hashlib.sha256(layer).hexdigest()
+    manifest = json.dumps({"layers": [{"digest": ld}]}).encode()
+    md = "sha256:" + hashlib.sha256(manifest).hexdigest()
+    index = json.dumps({"manifests": [{"digest": md, "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                                       "platform": {"os": "linux", "architecture": "amd64"}}]}).encode()
+    idd = "sha256:" + hashlib.sha256(index).hexdigest()
+    reg = "https://registry-1.docker.io/v2/test/atlas"
+    routes = {"https://auth.docker.io/token?service=registry.docker.io&scope=repository:test/atlas:pull":
+              Resp(200, b'{"token": "t"}'), f"{reg}/manifests/{idd}": Resp(200, index),
+              f"{reg}/manifests/{md}": Resp(200, manifest), f"{reg}/blobs/{ld}": Resp(200, layer + (b"X" if tamper else b""))}
+    pin = {"kind": "image", "repo": "test/atlas", "index": idd, "prefix": PREFIX, "hosts": ("auth.docker.io", "registry-1.docker.io")}
+    return (lambda url, headers: routes.get(url, Resp(404))), pin
+
+
+real_fetch = artifacts.fetch
+
+
+def fresh(name):
+    os.makedirs(os.path.join(TMP, name))
+    return os.path.join(TMP, name)
+
+
+def use(files, tamper=False):
+    transport, pin = registry(files, tamper)
+
+    def fake(name, dest, **kw):
+        CALLS.append(name)
+        return real_fetch(name, dest, transport=transport, pins={name: pin}, **kw)
+    launcher.artifacts.fetch = fake
 
 
 # --- launcher: fetch_atlas ---------------------------------------------------------------------------------------
-real_fetch = launcher.fetch_pinned_image
-launcher.fetch_pinned_image = fake_fetch
+os.environ["APP_ARCH"] = "amd64"
+use(ATLAS_FILES)
+n0 = len(launcher.EVENTS)
 root = launcher.fetch_atlas(WORK)
 check("L1 fetch_atlas returns the ATLAS folder", root == os.path.join(WORK, "atlas"), root)
-check("L2 fetch_atlas pins image, digest and prefix",
-      CALLS == [("ohdsi/atlas", launcher.ATLAS_INDEX, "usr/share/nginx/html/atlas/")]
-      and re.fullmatch(r"sha256:[0-9a-f]{64}", launcher.ATLAS_INDEX or "") is not None, CALLS)
+pin = artifacts.PINS["atlas"]
+check("L2 fetch_atlas fetches the atlas pin: image, digest and prefix",
+      CALLS == ["atlas"] and (pin["kind"], pin["repo"], pin["prefix"]) == ("image", "ohdsi/atlas", PREFIX)
+      and re.fullmatch(r"sha256:[0-9a-f]{64}", pin["index"]) is not None, CALLS)
 cfg = open(os.path.join(root, "js", "config-local.js")).read() if root else ""
 check("L3 the generated config replaces the image's own", cfg == launcher.ATLAS_CONFIG and "evil" not in cfg, cfg[:80])
 check("L4 generated config: sign-in on, no login providers, terms off",
@@ -61,6 +108,10 @@ check("L4 generated config: sign-in on, no login providers, terms off",
 check("L5 generated config: WebAPI on the app's own address only",
       'window.location.origin + "/WebAPI/"' in cfg and not re.search(r"https?://", cfg), cfg)
 check("L6 an atlas event is logged", any(e["event"] == "atlas" for e in launcher.EVENTS))
+check("L6b the image's symlink is skipped and logged", root is not None
+      and not os.path.lexists(os.path.join(root, "images", "leak.png"))
+      and any(e["event"] == "link_skipped" and e.get("path") == "images/leak.png" for e in launcher.EVENTS[n0:]))
+os.symlink(os.path.join(TMP, "secret.txt"), os.path.join(root, "images", "leak.png"))  # hostile, for the server checks
 
 # hostile: the image's config-local.js is a symlink to a file outside the tree; the write must not go through it
 target = os.path.join(TMP, "outside-config.js")
@@ -73,26 +124,17 @@ check("L7 config write replaces a symlink, never writes through it",
       open(target).read() == "OUTSIDE-CONFIG" and not os.path.islink(os.path.join(root, "js", "config-local.js"))
       and open(os.path.join(root, "js", "config-local.js")).read() == launcher.ATLAS_CONFIG)
 
-
-def failing(*a, **k):
-    raise RuntimeError("layer digest mismatch: want sha256:aa, got sha256:bb")
-
-
-launcher.fetch_pinned_image = failing
+use(ATLAS_FILES, tamper=True)
 n0 = len(launcher.EVENTS)
-check("L8 a failed ATLAS fetch returns None", launcher.fetch_atlas(os.path.join(TMP, "work2")) is None)
+check("L8 a failed ATLAS fetch returns None", launcher.fetch_atlas(fresh("work2")) is None)
 err = [e for e in launcher.EVENTS[n0:] if e["event"] == "atlas_error"]
 check("L9 a failed ATLAS fetch logs atlas_error with the reason", bool(err) and "digest mismatch" in err[0].get("error", ""), err)
 
-
-def no_index(image_name, index_digest, path_prefix, target_folder, work, platform_arch=None):
-    os.makedirs(os.path.join(target_folder, "js"), exist_ok=True)
-    return target_folder, 0
-
-
-launcher.fetch_pinned_image = no_index
-check("L10 an image without index.html gives None", launcher.fetch_atlas(os.path.join(TMP, "work3")) is None)
-launcher.fetch_pinned_image = real_fetch
+use({"js/main.js": "var atlasMain = 1;"})
+n0 = len(launcher.EVENTS)
+check("L10 an image without index.html gives None", launcher.fetch_atlas(fresh("work3")) is None
+      and any("index.html" in e.get("error", "") for e in launcher.EVENTS[n0:] if e["event"] == "atlas_error"))
+launcher.artifacts.fetch = real_fetch
 
 
 # --- front server: /atlas ----------------------------------------------------------------------------------------

@@ -13,7 +13,7 @@ import argparse, hashlib, os, re, shutil, sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP = os.path.join(REPO, "app")
-APP_FILES = ("launcher.py", "server.py", "pgb.py", "monitors.py", "bridge.py", "requirements.txt")
+APP_FILES = ("launcher.py", "artifacts.py", "server.py", "pgb.py", "monitors.py", "bridge.py", "requirements.txt")
 BINARY = "pgbouncer-1.26.1-linux-amd64-static"  # the name app/launcher.py looks for
 RULES = {  # setting -> pattern its value must match
     "LAKEBASE_HOST": r"[A-Za-z0-9.-]+",

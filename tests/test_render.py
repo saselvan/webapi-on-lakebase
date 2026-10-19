@@ -49,7 +49,7 @@ for v in ('value: "db-host.example.org"', "value: webapi_test", 'value: "VOCAB"'
     assert v in text, v
 assert oct(os.stat(out).st_mode & 0o777) == "0o600"
 stage = os.path.dirname(out)
-for f in ("launcher.py", "server.py", "pgb.py", "monitors.py", "bridge.py", "requirements.txt",
+for f in ("launcher.py", "artifacts.py", "server.py", "pgb.py", "monitors.py", "bridge.py", "requirements.txt",
           "pgbouncer-1.26.1-linux-amd64-static"):
     assert os.path.isfile(os.path.join(stage, f)), f
 assert not os.path.exists(os.path.join(stage, "queries.json"))

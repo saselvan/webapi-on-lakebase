@@ -1,13 +1,13 @@
 """Run OHDSI WebAPI 2.15.2 as a Databricks App, in the workspace's region, against WebAPI's database on Lakebase.
 
-Databricks Apps has no Java runtime and no root, so the launcher brings its own:
-1. the Temurin 8u492-b09 JRE (the Java build of the pinned WebAPI image), checked by SHA-256;
-2. /var/lib/ohdsi/webapi from the pinned image ohdsi/webapi@sha256:bc5cffde... (its linux/amd64 manifest),
-   fetched from Docker Hub by digest; the manifest and every layer are checked by SHA-256;
-3. ATLAS 2.15.0 (/usr/share/nginx/html/atlas) from the pinned image ohdsi/atlas@sha256:6814e8c5..., checked the same
-   way, with its config-local.js replaced by ATLAS_CONFIG. If that fails, WebAPI still starts and /atlas answers 503;
-4. Databricks JDBC 2.6.36 (for a CDM in Delta, read through a SQL warehouse) into WebAPI's WEB-INF/lib: the zip and the
-   one jar read from it are both checked by SHA-256. A wrong file stops the launcher.
+Databricks Apps has no Java runtime and no root, so the launcher brings its own pinned artifacts (app/artifacts.py
+fetches each one and checks every byte against a digest in its PINS):
+1. the Temurin 8u492-b09 JRE (the Java build of the pinned WebAPI image);
+2. /var/lib/ohdsi/webapi from the pinned image ohdsi/webapi@sha256:bc5cffde..., fetched from Docker Hub by digest;
+3. ATLAS 2.15.0 (/usr/share/nginx/html/atlas) from the pinned image ohdsi/atlas@sha256:6814e8c5..., with its
+   config-local.js replaced by ATLAS_CONFIG. If that fails, WebAPI still starts and /atlas answers 503;
+4. Databricks JDBC 2.6.36 (for a CDM in Delta, read through a SQL warehouse) into WebAPI's WEB-INF/lib. A wrong file
+   stops the launcher.
 Then it runs WebAPI on 127.0.0.1:APP_JAVA_PORT, and server.py on DATABRICKS_APP_PORT (forwards /WebAPI, serves
 /atlas and /ops).
 
@@ -24,29 +24,10 @@ BRIDGE_SECRET and SECURITY_PROVIDER=AtlasRegularSecurity with only the DB login 
 hash of the secret, builds WebAPI's DB-login query from it, points that login at PgBouncer, and keeps the raw secret
 out of Java's environment. It refuses to start on any other security setting.
 """
-import urllib.error
-import hashlib, json, os, platform, shutil, signal, subprocess, sys, tarfile, threading, time, urllib.request, zipfile
+import hashlib, json, os, shutil, signal, subprocess, sys, threading, time
 
-JRE = {
-    "x86_64": ("OpenJDK8U-jre_x64_linux_hotspot_8u492b09.tar.gz",
-               "8eef3d4a837bb7a9e45d30a7579d84d5b76a4321f4376573311e6bf89e48f9b0"),
-    "aarch64": ("OpenJDK8U-jre_aarch64_linux_hotspot_8u492b09.tar.gz",
-                "d5e50cb002600007dbdfac523605d26196607fa5212db0942ef05cdce9fe2892"),
-}
-JRE_BASE = "https://github.com/adoptium/temurin8-binaries/releases/download/jdk8u492-b09/"
-IMAGE_REPO = "ohdsi/webapi"
-IMAGE_INDEX = "sha256:bc5cffde0d6f29bccc994876bf3cb290e8c3f4e5c087ab28c7163343c0b67393"  # WebAPI 2.15.2
-PLATFORM_ARCH = {"x86_64": "amd64", "aarch64": "arm64"}
-WEBAPI_PREFIX = "var/lib/ohdsi/webapi/"
-ATLAS_REPO = "ohdsi/atlas"
-ATLAS_INDEX = "sha256:6814e8c5b5366b50bc197b1eb2881689e5852784742b91b9636eec514f5a555e"  # ATLAS 2.15.0
-ATLAS_PREFIX = "usr/share/nginx/html/atlas/"
-JDBC_ZIP = ("https://databricks-bi-artifacts.s3.us-east-2.amazonaws.com/simbaspark-drivers/jdbc/2.6.36/"
-            "DatabricksJDBC42-2.6.36.1062.zip")
-JDBC_ZIP_SHA = "886fb56d96029cfc8e21bd7520ce7888c1ca81a13d9dea58f5c852127959bab0"
-JDBC_ENTRY = "DatabricksJDBC42-2.6.36.1062/DatabricksJDBC42.jar"
-JDBC_JAR_SHA = "83ba88ba02c4765630f99ba5e2a193b511a5c8eb867b6d44941a562100e21563"
-JDBC_JAR = "DatabricksJDBC42.jar"
+import artifacts
+
 ATLAS_CONFIG = """define([], function () {
   // Written by app/launcher.py at start; it replaces the image's own config-local.js.
   // WebAPI is this app's /WebAPI/. Sign-in is on: ATLAS asks /WebAPI/user/me, and the front server answers as the
@@ -65,10 +46,6 @@ PGB_BINARY = "pgbouncer-1.26.1-linux-amd64-static"  # pgbouncer/Dockerfile.stati
 PGB_WEBAPI_URL = "jdbc:postgresql://127.0.0.1:6432/webapi?sslmode=disable&ApplicationName=webapi-pgb"
 PGB_AUTH_URL = "jdbc:postgresql://127.0.0.1:6432/webapi?sslmode=disable&ApplicationName=webapi-pgb-auth"
 AUTH_OFF = ("WINDOWS", "KERBEROS", "OPENID", "FACEBOOK", "GITHUB", "GOOGLE", "LDAP", "AD", "CAS")
-MANIFEST_TYPES = ",".join([
-    "application/vnd.oci.image.index.v1+json", "application/vnd.oci.image.manifest.v1+json",
-    "application/vnd.docker.distribution.manifest.list.v2+json", "application/vnd.docker.distribution.manifest.v2+json",
-])
 
 
 EVENTS = []  # every launcher log event, kept for /ops/status: the app log drops start-up lines (no secrets, no cmd)
@@ -89,190 +66,19 @@ def sha256_file(path):
 
 
 def fetch_jre(work):
-    """Download and verify the pinned JRE; return the java binary path."""
-    name, sha = JRE[platform.machine()]
-    path = os.path.join(work, name)
-    urllib.request.urlretrieve(JRE_BASE + name, path)
-    got = sha256_file(path)
-    if got != sha:
-        raise RuntimeError(f"JRE sha256 mismatch: {got}")
-    with tarfile.open(path) as t:
-        t.extractall(work)
-    os.remove(path)
-    java = next(os.path.join(work, d, "bin", "java") for d in os.listdir(work) if d.startswith("jdk8u"))
-    log("jre", sha256=got, java=java)
+    """The pinned JRE into work/jre; return the java binary path."""
+    java = os.path.join(artifacts.fetch("jre", os.path.join(work, "jre"), log=log), "bin", "java")
+    if not os.path.isfile(java):
+        raise RuntimeError("bin/java not found in the JRE")
     return java
 
 
-def _registry_get(url, token, accept=None):
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}", **({"Accept": accept} if accept else {})})
-    return urllib.request.urlopen(req, timeout=120)
-
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):
-        return None
-
-
-def _open_blob(url, token):
-    """Blobs redirect to object storage; follow the redirect WITHOUT the registry token
-    (urllib forwards Authorization, and S3 refuses a request with a second auth mechanism: HTTP 400)."""
-    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-    try:
-        return urllib.request.build_opener(_NoRedirect).open(req, timeout=120)
-    except urllib.error.HTTPError as e:
-        if e.code not in (301, 302, 303, 307, 308):
-            raise
-        return urllib.request.urlopen(e.headers["Location"], timeout=300)
-
-
-def _digest_bytes(data, digest):
-    got = "sha256:" + hashlib.sha256(data).hexdigest()
-    if got != digest:
-        raise RuntimeError(f"digest mismatch: want {digest}, got {got}")
-
-
-def platform_manifest(token, image_repo=IMAGE_REPO, index_digest=IMAGE_INDEX, platform_arch="amd64"):
-    """Resolve a pinned index to a platform manifest; both are checked by digest.
-
-    Args:
-        token: Docker Hub auth token.
-        image_repo: image name (e.g. "ohdsi/webapi").
-        index_digest: pinned index digest (e.g. "sha256:abc123...").
-        platform_arch: target architecture (e.g. "amd64").
-
-    Returns: manifest dict.
-    Raises: RuntimeError if index/manifest digests don't match or platform not found.
-    """
-    base = f"https://registry-1.docker.io/v2/{image_repo}/manifests/"
-    index = _registry_get(base + index_digest, token, MANIFEST_TYPES).read()
-    _digest_bytes(index, index_digest)
-
-    # Find the matching platform manifest
-    entry = next((m for m in json.loads(index)["manifests"]
-                  if m.get("platform", {}).get("os") == "linux" and m.get("platform", {}).get("architecture") == platform_arch),
-                 None)
-    if not entry:
-        raise RuntimeError(f"no manifest for linux/{platform_arch} in index {index_digest}")
-
-    manifest = _registry_get(base + entry["digest"], token, entry["mediaType"]).read()
-    _digest_bytes(manifest, entry["digest"])
-    log("manifest", index=index_digest, platform=f"linux/{platform_arch}", digest=entry["digest"])
-    return json.loads(manifest)
-
-
-def fetch_pinned_image(image_name, index_digest, path_prefix, target_folder, work, platform_arch=None):
-    """Download files from a pinned Docker image by digest; validate supply chain at each step.
-
-    Args:
-        image_name: Docker image name (e.g. "ohdsi/webapi").
-        index_digest: pinned index digest (e.g. "sha256:abc123...").
-        path_prefix: prefix path inside the image to extract (e.g. "var/lib/ohdsi/webapi/").
-        target_folder: local folder to extract files into.
-        work: work directory for intermediate blobs.
-        platform_arch: target architecture (default: this machine's architecture, or from APP_ARCH env).
-
-    Returns: target_folder path.
-
-    Rejects:
-        - Manifests/layers whose digest doesn't match the pinned hash.
-        - Wrong platform manifest.
-        - Tar entries with ../, absolute paths, or symlinks pointing outside the prefix.
-        - Whiteouts attempting to delete outside the prefix.
-    """
-    if platform_arch is None:
-        platform_arch = os.environ.get("APP_ARCH") or PLATFORM_ARCH[platform.machine()]
-
-    os.makedirs(target_folder, exist_ok=True)
-    tok = json.load(urllib.request.urlopen(
-        f"https://auth.docker.io/token?service=registry.docker.io&scope=repository:{image_name}:pull", timeout=60))["token"]
-
-    manifest = platform_manifest(tok, image_name, index_digest, platform_arch)
-
-    for layer in manifest["layers"]:
-        blob = os.path.join(work, "layer.blob")
-        with _open_blob(f"https://registry-1.docker.io/v2/{image_name}/blobs/{layer['digest']}", tok) as r, open(blob, "wb") as f:
-            shutil.copyfileobj(r, f, 1 << 20)
-
-        # Validate layer digest before extraction
-        got_digest = "sha256:" + sha256_file(blob)
-        if got_digest != layer["digest"]:
-            raise RuntimeError(f"layer digest mismatch: want {layer['digest']}, got {got_digest}")
-
-        _apply_layer(blob, target_folder, path_prefix)
-        os.remove(blob)
-
-    file_count = sum(len(f) for _, _, f in os.walk(target_folder))
-    return target_folder, file_count
-
-
-def _apply_layer(blob_path, root, prefix=WEBAPI_PREFIX):
-    """Extract only files under prefix from one layer; honour whiteouts from later layers.
-
-    Rejects: tar entries with ../ or absolute paths, symlinks pointing outside prefix,
-    whiteouts attempting to modify outside prefix.
-    """
-    with tarfile.open(blob_path) as t:  # gzip or plain tar, autodetected
-        for m in t:
-            normalized = m.name.lstrip("./")
-            if not normalized.startswith(prefix):
-                continue
-            rel = normalized[len(prefix):]
-
-            # Reject entries with absolute paths, ../, or null bytes (path traversal attempts)
-            if rel.startswith("/") or "\x00" in rel:
-                raise RuntimeError(f"tar entry escapes prefix: {m.name}")
-
-            # Check for ../ using os.path.normpath to catch all forms of traversal
-            normalized_rel = os.path.normpath(rel)
-            if normalized_rel.startswith(".."):
-                raise RuntimeError(f"tar entry escapes prefix: {m.name}")
-
-            base = os.path.basename(rel)
-            if base.startswith(".wh."):
-                # Whiteout: must be for a file within the prefix
-                whiteout_target_rel = rel[:-len(base)] + base[4:]  # remove .wh. prefix
-                if whiteout_target_rel.startswith("/") or "\x00" in whiteout_target_rel:
-                    raise RuntimeError(f"whiteout escapes prefix: {m.name}")
-                normalized_whiteout = os.path.normpath(whiteout_target_rel)
-                if normalized_whiteout.startswith(".."):
-                    raise RuntimeError(f"whiteout escapes prefix: {m.name}")
-                target = os.path.join(root, whiteout_target_rel)
-                shutil.rmtree(target, ignore_errors=True) if os.path.isdir(target) else (os.path.exists(target) and os.remove(target))
-                continue
-
-            # Reject symlinks (they could point outside the prefix)
-            if m.issym() or m.islnk() or m.isdev():
-                continue  # WebAPI's tree is plain files and directories
-
-            # Final safety check: ensure the final path is within root
-            final_path = os.path.join(root, rel)
-            # Normalize and check that it's within root (after normalization)
-            norm_final = os.path.normpath(final_path)
-            norm_root = os.path.normpath(root)
-            if not norm_final.startswith(norm_root + os.sep) and norm_final != norm_root:
-                raise RuntimeError(f"final path escapes root: {final_path}")
-
-            m.name = rel
-            if rel:
-                t.extract(m, root)
-
-
 def fetch_webapi(work):
-    """Download WebAPI's directory from the pinned image; return its path.
-
-    Uses the generic fetch_pinned_image with today's pinned values, then verifies WebAPI files.
-    """
-    root = os.path.join(work, "webapi")
-    target, file_count = fetch_pinned_image(IMAGE_REPO, IMAGE_INDEX, WEBAPI_PREFIX, root, work)
-    
-    # WebAPI-specific validation
-    if not os.path.isfile(os.path.join(target, "WebAPI.jar")) and not os.path.isdir(os.path.join(target, "WEB-INF")):
+    """WebAPI's directory from the pinned image into work/webapi; return its path."""
+    root = artifacts.fetch("webapi", os.path.join(work, "webapi"), log=log)
+    if not os.path.isfile(os.path.join(root, "WebAPI.jar")) and not os.path.isdir(os.path.join(root, "WEB-INF")):
         raise RuntimeError("WebAPI directory not found in the image layers")
-    
-    # Log uses file_count returned from fetch_pinned_image; layer count would require another fetch
-    log("webapi", files=file_count)
-    return target
+    return root
 
 
 def write_atlas_config(root):
@@ -287,48 +93,21 @@ def write_atlas_config(root):
 def fetch_atlas(work):
     """ATLAS 2.15.0 from the pinned image, with the generated config. Returns its folder, or None after an
     atlas_error event: WebAPI still starts, and /atlas answers 503 with the reason."""
-    root = os.path.join(work, "atlas")
     try:
-        _, n = fetch_pinned_image(ATLAS_REPO, ATLAS_INDEX, ATLAS_PREFIX, root, work)
+        root = artifacts.fetch("atlas", os.path.join(work, "atlas"), log=log)
         if not os.path.isfile(os.path.join(root, "index.html")):
             raise RuntimeError("index.html not found in the ATLAS image")
         write_atlas_config(root)
     except Exception as e:
         log("atlas_error", error=f"{type(e).__name__}: {e}"[:300])
         return None
-    log("atlas", index=ATLAS_INDEX, files=n)
     return root
 
 
 def fetch_jdbc(work, root):
-    """Databricks JDBC 2.6.36 into WebAPI's WEB-INF/lib; return the jar path. Only the one pinned entry is read from
-    the zip (no extract). A jar or symlink already at the target, or a lib folder that is a symlink, is refused."""
-    path = os.path.join(work, "databricks-jdbc.zip")
-    try:
-        urllib.request.urlretrieve(JDBC_ZIP, path)
-        got = sha256_file(path)
-        if got != JDBC_ZIP_SHA:
-            raise RuntimeError(f"JDBC zip sha256 mismatch: {got}")
-        with zipfile.ZipFile(path) as z:
-            data = z.read(JDBC_ENTRY)
-    except KeyError:
-        raise RuntimeError(f"{JDBC_ENTRY} not in the JDBC zip") from None
-    finally:
-        if os.path.lexists(path):
-            os.remove(path)
-    got = hashlib.sha256(data).hexdigest()
-    if got != JDBC_JAR_SHA:
-        raise RuntimeError(f"JDBC jar sha256 mismatch: {got}")
-    lib = os.path.join(root, "WEB-INF", "lib")
-    if os.path.islink(lib) or not os.path.isdir(lib):
-        raise RuntimeError("WEB-INF/lib is missing or a symlink")
-    dest = os.path.join(lib, JDBC_JAR)
-    if os.path.lexists(dest):
-        raise RuntimeError(f"{JDBC_JAR} is already in WEB-INF/lib")
-    with open(dest, "xb") as f:
-        f.write(data)
-    log("jdbc", sha256=got, jar=JDBC_JAR)
-    return dest
+    """Databricks JDBC 2.6.36 into WebAPI's WEB-INF/lib; return the jar path. A jar or symlink already at the target,
+    or a lib folder that is a symlink, is refused."""
+    return artifacts.fetch("jdbc", os.path.join(root, "WEB-INF", "lib"), log=log)
 
 
 def java_cmd(java, root):
@@ -434,7 +213,8 @@ def main():
 if __name__ == "__main__":
     if sys.argv[1:] == ["--fetch-only"]:  # laptop check: download and verify, do not start WebAPI
         w = os.environ.get("APP_WORK", "/tmp/webapi-app")
-        os.makedirs(w, exist_ok=True)
+        shutil.rmtree(w, ignore_errors=True)
+        os.makedirs(w)
         r = fetch_webapi(w)
         print(r)
         print(fetch_jdbc(w, r))

@@ -167,12 +167,33 @@ Before the call (as a workspace admin):
 
 The token ends at its lifetime. Then make a new one and change the source's password in WebAPI.
 
+## What the app downloads
+
+On every start, the launcher downloads four pinned artifacts through `app/artifacts.py`. A SHA-256 in the code fixes
+each one, and the launcher checks every byte before it writes the byte to disk.
+
+| Artifact | From | Hosts the download contacts |
+|---|---|---|
+| Temurin 8u492-b09 JRE | GitHub release | `github.com`, `release-assets.githubusercontent.com` |
+| WebAPI 2.15.2 files | `ohdsi/webapi` image on Docker Hub | `auth.docker.io`, `registry-1.docker.io`, `production.cloudfront.docker.com` |
+| ATLAS 2.15.0 files | `ohdsi/atlas` image on Docker Hub | the same 3 Docker Hub hosts |
+| Databricks JDBC 2.6.36 | Databricks' driver bucket | `databricks-bi-artifacts.s3.us-east-2.amazonaws.com` |
+
+If you limit the app's outbound network, allow these 6 hosts. `release-assets.githubusercontent.com` and
+`production.cloudfront.docker.com` are redirect targets: GitHub and Docker Hub send the files from there, and they can
+change these hosts. The launcher logs each host it contacts as a `host` event in `/ops/status`, with `known: false`
+for a host that is not in this table. It does not refuse that host, so a blocked new host shows in the events.
+
+The downloads write files only in their own folders and never through a symlink. They skip the symlinks and hard
+links in the archives and log each one as a `link_skipped` event (the JRE has 2).
+
 ## How the code is laid out
 
 ```text
 webapi-on-lakebase/
 ├── app/                         # runs inside the Databricks App
 │   ├── launcher.py              # entry point: gets Java, WebAPI and ATLAS, starts PgBouncer, checks security, WebAPI
+│   ├── artifacts.py             # the pinned downloads (JRE, WebAPI, ATLAS, JDBC driver), each checked by SHA-256
 │   ├── pgb.py                   # PgBouncer process and the token refresher
 │   ├── bridge.py                # proxy identity -> WebAPI login, and the request gate
 │   ├── server.py                # front server on the app port: /WebAPI/... (through the bridge), /atlas/..., /ops/...
@@ -187,7 +208,7 @@ webapi-on-lakebase/
 │   ├── check.sh                 # runs every offline test
 │   ├── webapi_admin.py          # first admin, the vocabulary source, roles, checks
 │   └── teardown.sh              # removes what setup made, then checks
-├── tests/                       # offline: test_app, test_bridge, test_render, test_atlas, test_image_fetch
+├── tests/                       # offline: test_app, test_bridge, test_render, test_atlas, test_artifacts, test_cdm_source
 ├── .github/workflows/check.yml  # runs tools/check.sh on each push
 └── config.env.example           # your settings
 ```
@@ -196,9 +217,10 @@ What happens when the app starts (`app/launcher.py`, `main`):
 
 ```text
 main
-  fetch_jre                  # Temurin 8 JRE, SHA-256 checked
-  fetch_webapi               # WebAPI 2.15.2 image from Docker Hub, manifest and every layer checked by digest
-  fetch_atlas                # ATLAS 2.15.0 image the same way, then the generated config-local.js; on error: None
+  fetch_jre                  # artifacts.fetch("jre"): Temurin 8 JRE, SHA-256 checked
+  fetch_webapi               # artifacts.fetch("webapi"): image from Docker Hub, manifest and every layer checked by digest
+  fetch_jdbc                 # artifacts.fetch("jdbc"): the driver jar into WEB-INF/lib; a wrong file stops the start
+  fetch_atlas                # artifacts.fetch("atlas"), then the generated config-local.js; on error: None
   start_pgbouncer            # APP_DB=pgbouncer
     check the binary's SHA-256 against PGB_SHA256   # refuses to start if unset or different
     PgBouncer.start
@@ -383,7 +405,7 @@ flowchart LR
    them to the roles they need, for example `role-add "Source user (<SOURCE_KEY>)" <their email>` and
    `role-add "Atlas users" <their email>`.
 
-6. Check `GET <app url>/ops/status`: the launcher events (token, PgBouncer listening, bridge, Java start),
+6. Check `GET <app url>/ops/status`: the launcher events (downloads and their hosts, token, PgBouncer listening, bridge, Java start),
    `cold_done` and the bridge's login counts. `GET <app url>/ops/conn` shows the refresher, the in-app checks every
    60 s, and the Lakebase session counts. The in-app load runner needs your own `queries.json` (set `QUERIES_JSON`)
    and `OPS_CONTROL=on`; without them `/ops/run` answers 404. Then open `<app url>/atlas/`.
@@ -401,9 +423,9 @@ It runs the 6 test files in `tests/` with pinned test packages (through `uv`), a
 on each push. All tests run offline, with no Databricks, Lakebase or Java. `tests/test_bridge.py` runs the real front server and
 bridge against a fake WebAPI, with checks for each item of the security list above. `tests/test_atlas.py` runs the
 front server on a fake ATLAS tree with hostile files (a config that turns sign-in off, symlinks out of the tree), and
-`tests/test_image_fetch.py` feeds the image download hostile layers (`..`, absolute paths, whiteouts, wrong digests).
-`tests/test_cdm_source.py` feeds the driver fetch tampered zips and symlinks, and `source-add-cdm` logins smuggled
-into the URL and token files that others can read.
+`tests/test_artifacts.py` feeds the four downloads hostile archives (`..`, absolute paths, whiteouts, symlinks, wrong
+digests), hostile redirects, and checks that this README names every known host. `tests/test_cdm_source.py` feeds
+`source-add-cdm` logins smuggled into the URL and token files that others can read.
 
 ## Teardown
 

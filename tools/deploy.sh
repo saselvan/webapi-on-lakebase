@@ -21,7 +21,7 @@ umask 077
 state=$(databricks apps get "$APP" --profile "$P" -o json | python3 -I -c 'import sys,json; print((json.load(sys.stdin).get("compute_status") or {}).get("state"))')
 [ "$state" = "ACTIVE" ] || { echo "app compute is $state, not ACTIVE; start it: databricks apps start $APP --profile $P"; exit 1; }
 
-code=(launcher.py server.py pgb.py monitors.py bridge.py requirements.txt)
+code=(launcher.py artifacts.py server.py pgb.py monitors.py bridge.py requirements.txt)
 commit=$(git -C "$REPO" rev-parse --short HEAD)
 for f in "${code[@]}"; do
   git -C "$REPO" show "HEAD:app/$f" | cmp -s - "$SRC/$f" \
