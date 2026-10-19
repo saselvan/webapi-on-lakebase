@@ -18,6 +18,8 @@ Pins are a JRE tarball, two image directories and one jar from a zip. PgBouncer 
 """
 import hashlib, json, os, platform, tarfile, tempfile, urllib.error, urllib.parse, urllib.request, zipfile
 
+DOCKER_HOSTS = ("auth.docker.io", "registry-1.docker.io",  # layers come from CloudFront or S3, by client location
+                "production.cloudfront.docker.com", "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com")
 PINS = {
     "jre": {
         "kind": "tarball",  # Temurin 8u492-b09, the Java build of the pinned WebAPI image
@@ -39,14 +41,14 @@ PINS = {
         "repo": "ohdsi/webapi",
         "index": "sha256:bc5cffde0d6f29bccc994876bf3cb290e8c3f4e5c087ab28c7163343c0b67393",
         "prefix": "var/lib/ohdsi/webapi/",
-        "hosts": ("auth.docker.io", "registry-1.docker.io", "production.cloudfront.docker.com"),
+        "hosts": DOCKER_HOSTS,
     },
     "atlas": {
         "kind": "image",  # ATLAS 2.15.0
         "repo": "ohdsi/atlas",
         "index": "sha256:6814e8c5b5366b50bc197b1eb2881689e5852784742b91b9636eec514f5a555e",
         "prefix": "usr/share/nginx/html/atlas/",
-        "hosts": ("auth.docker.io", "registry-1.docker.io", "production.cloudfront.docker.com"),
+        "hosts": DOCKER_HOSTS,
     },
     "jdbc": {
         "kind": "zip_entry",  # Databricks JDBC 2.6.36: only the one jar is read from the zip

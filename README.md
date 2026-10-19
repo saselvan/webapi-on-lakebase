@@ -175,17 +175,18 @@ each one, and the launcher checks every byte before it writes the byte to disk.
 | Artifact | From | Hosts the download contacts |
 |---|---|---|
 | Temurin 8u492-b09 JRE | GitHub release | `github.com`, `release-assets.githubusercontent.com` |
-| WebAPI 2.15.2 files | `ohdsi/webapi` image on Docker Hub | `auth.docker.io`, `registry-1.docker.io`, `production.cloudfront.docker.com` |
-| ATLAS 2.15.0 files | `ohdsi/atlas` image on Docker Hub | the same 3 Docker Hub hosts |
+| WebAPI 2.15.2 files | `ohdsi/webapi` image on Docker Hub | `auth.docker.io`, `registry-1.docker.io`, `production.cloudfront.docker.com`, `docker-images-prod.s3.dualstack.us-east-1.amazonaws.com` |
+| ATLAS 2.15.0 files | `ohdsi/atlas` image on Docker Hub | the same 4 Docker Hub hosts |
 | Databricks JDBC 2.6.36 | Databricks' driver bucket | `databricks-bi-artifacts.s3.us-east-2.amazonaws.com` |
 
-If you limit the app's outbound network, allow these 6 hosts. `release-assets.githubusercontent.com` and
-`production.cloudfront.docker.com` are redirect targets: GitHub and Docker Hub send the files from there, and they can
-change these hosts. The launcher logs each host it contacts as a `host` event in `/ops/status`, with `known: false`
+If you limit the app's outbound network, allow these 7 hosts. `release-assets.githubusercontent.com` and the last two
+Docker Hub hosts are redirect targets: GitHub and Docker Hub send the files from there, and they can change these
+hosts. Docker Hub picks the layer host by where the client is: the app (on AWS) got the S3 host, a laptop got
+CloudFront. The launcher logs each host it contacts as a `host` event in `/ops/status`, with `known: false`
 for a host that is not in this table. It does not refuse that host, so a blocked new host shows in the events.
 
 The downloads write files only in their own folders and never through a symlink. They skip the symlinks and hard
-links in the archives and log each one as a `link_skipped` event (the JRE has 2).
+links in the archives and log each one as a `link_skipped` event (the JRE has 2, ATLAS has 27 in `node_modules/.bin`).
 
 ## How the code is laid out
 
