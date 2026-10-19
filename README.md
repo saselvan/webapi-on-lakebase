@@ -144,7 +144,7 @@ If the ATLAS download fails, WebAPI still starts, `/atlas/` answers 503 with the
 
 WebAPI can also read your OMOP CDM where it already is: in Delta tables, through a Databricks SQL warehouse. Nothing
 is copied into Lakebase for this. The launcher downloads Databricks JDBC 2.6.36 from Databricks' public driver
-bucket, checks the zip and the one jar it reads by SHA-256, and puts the jar in WebAPI's `WEB-INF/lib`. A wrong file
+bucket, `databricks-bi-artifacts.s3.us-east-2.amazonaws.com`, on every start, checks the zip and the one jar it reads by SHA-256, and puts the jar in WebAPI's `WEB-INF/lib`. A wrong file
 stops the launcher before Java starts.
 
 `tools/webapi_admin.py source-add-cdm` adds the source by REST, as an admin. The JDBC URL holds no login (`AuthMech=3`):
